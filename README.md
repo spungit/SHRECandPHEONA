@@ -12,3 +12,11 @@ Folder Descriptions:
 3) PHEONA for Phenotyping: Includes code to run the PHEONA evaluation tests for the phenotyping task specifically.
 4) RunClassification: Includes code to run the LLM classification of the constructed concepts.
 5) RunPhenotyping: Includes code to run the LLM phenotyping of the constructed descriptions after data has been processed following concept classification.
+
+Run the Ollama server using the following terminal command:
+
+OLLAMA_HOST=127.0.0.1:11434 ollama serve
+
+Run the main.py files using the following terminal command (assuming Python is installed and a virtual environment has been setup):
+
+python3 main.py mistral 11434
