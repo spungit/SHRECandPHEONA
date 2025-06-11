@@ -80,3 +80,13 @@ for m in models:
         print(f'Class {cls}: AUC = {auc:.2f}')
 
     sensitivity, specificity = calculate_sensitivity_specificity(confusion, labels=classes)
+
+    ## calculate average of the aucs
+    avg_auc = np.mean(list(class_specific_auc.values()))
+    print(f'Average AUC: {avg_auc:.2f}')
+
+    avg_for_classes_012 = np.mean([class_specific_auc[0], class_specific_auc[1], class_specific_auc[2], class_specific_auc[-1]])
+    print(f'Average AUC for classes 0, 1, 2, and -1 (single treatment classes): {avg_for_classes_012:.2f}')
+
+    avg_for_remaining_classes = np.mean([class_specific_auc[3], class_specific_auc[4], class_specific_auc[5], class_specific_auc[6]])
+    print(f'Average AUC for remaining classes 3, 4, 5, and 6 (multiple treatment classes): {avg_for_remaining_classes:.2f}')
