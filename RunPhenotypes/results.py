@@ -13,10 +13,10 @@ def calculate_sensitivity_specificity(confusion_matrix, labels=None):
         fp = confusion_matrix[:, i].sum() - tp
         tn = confusion_matrix.sum() - (tp + fn + fp)
         
-        sens = float(round(tp / (tp + fn) if (tp + fn) > 0 else 0, 2))
-        spec = float(round(tn / (tn + fp) if (tn + fp) > 0 else 0, 2))
-        sensitivity.append(sens)
-        specificity.append(spec)
+        sens = round(tp / (tp + fn), 3) if (tp + fn) > 0 else 0
+        spec = round(tn / (tn + fp), 3) if (tn + fp) > 0 else 0
+        sensitivity.append(float(sens))
+        specificity.append(float(spec))
         if labels:
             print(f'Label {labels[i]}: Sensitivity = {sens}, Specificity = {spec}')
     return sensitivity, specificity
@@ -77,7 +77,7 @@ for m in models:
         auc = roc_auc_score(y_true_binary, y_pred_binary)
         class_specific_auc[cls] = auc
     for cls, auc in class_specific_auc.items():
-        print(f'Class {cls}: AUC = {auc:.2f}')
+        print(f'Class {cls}: AUC = {auc:.3f}')
 
     sensitivity, specificity = calculate_sensitivity_specificity(confusion, labels=classes)
 
@@ -85,8 +85,8 @@ for m in models:
     avg_auc = np.mean(list(class_specific_auc.values()))
     print(f'Average AUC: {avg_auc:.2f}')
 
-    avg_for_classes_012 = np.mean([class_specific_auc[0], class_specific_auc[1], class_specific_auc[2], class_specific_auc[-1]])
-    print(f'Average AUC for classes 0, 1, 2, and -1 (single treatment classes): {avg_for_classes_012:.2f}')
+    avg_for_classes_012none = np.mean([class_specific_auc[0], class_specific_auc[1], class_specific_auc[2], class_specific_auc[-1]])
+    print(f'Average AUC for classes 0, 1, 2, and -1 (single treatment classes): {avg_for_classes_012none:.3f}')
 
     avg_for_remaining_classes = np.mean([class_specific_auc[3], class_specific_auc[4], class_specific_auc[5], class_specific_auc[6]])
-    print(f'Average AUC for remaining classes 3, 4, 5, and 6 (multiple treatment classes): {avg_for_remaining_classes:.2f}')
+    print(f'Average AUC for remaining classes 3, 4, 5, and 6 (multiple treatment classes): {avg_for_remaining_classes:.3f}')
