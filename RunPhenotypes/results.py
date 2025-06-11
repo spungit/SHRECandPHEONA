@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.metrics import confusion_matrix, roc_auc_score
 from sklearn.preprocessing import label_binarize
 
-def calculate_sensitivity_specificity(confusion_matrix):
+def calculate_sensitivity_specificity(confusion_matrix, labels=None):
     sensitivity = []
     specificity = []
     for i in range(len(confusion_matrix)):
@@ -13,27 +13,34 @@ def calculate_sensitivity_specificity(confusion_matrix):
         fp = confusion_matrix[:, i].sum() - tp
         tn = confusion_matrix.sum() - (tp + fn + fp)
         
-        sensitivity.append(float(round(tp / (tp + fn) if (tp + fn) > 0 else 0, 2)))
-        specificity.append(float(round(tn / (tn + fp) if (tn + fp) > 0 else 0, 2)))
-    
+        sens = float(round(tp / (tp + fn) if (tp + fn) > 0 else 0, 2))
+        spec = float(round(tn / (tn + fp) if (tn + fp) > 0 else 0, 2))
+        sensitivity.append(sens)
+        specificity.append(spec)
+        if labels:
+            print(f'Label {labels[i]}: Sensitivity = {sens}, Specificity = {spec}')
     return sensitivity, specificity
 
 filepath = ''
 
+## get the number of ground truth outcomes
+patients_df = pd.read_csv('pts_with_outcomes.csv')
+gt_outcome_counts = pd.DataFrame(patients_df['outcome'].value_counts().sort_index())
+gt_outcome_counts['outcome_percentage'] = patients_df['outcome'].value_counts(normalize=True).sort_index()
+gt_outcome_counts['outcome_percentage'] = gt_outcome_counts['outcome_percentage'].apply(lambda x: f'{x:.1%}')
+print(f'Ground truth outcome counts:\n{gt_outcome_counts}')
+del patients_df, gt_outcome_counts
+
 models = ['mistralsmall24binstruct2501q80', 'gemma227binstructq80', 'phi414bq80']
 for m in models:
     print(f'\n\nProcessing model: {m}')
-    if os.path.exists(f'{filepath}/classified_descs_{m}_cot.csv'):
-        results_df = pd.read_csv(f'{filepath}/classified_descs_{m}_cot.csv')
-        patients_df = pd.read_csv(f'{filepath}/phenotyped_pts_{m}.csv')
+    print(f'Filepath: {filepath}/{m}_cot.csv')
+    if os.path.exists(f'{filepath}/final_phenotyped_pts_{m}.csv'):
+        print(f'Loading results for model {m}...')
+        results_df = pd.read_csv(f'{filepath}/final_phenotyped_pts_{m}.csv')
     else:
         print(f'File not found for model {m}. Skipping...')
         continue
-
-    print('\nPatients DataFrame:')
-    print(f'Shape of patients_df: {patients_df.shape}')
-    print('Columns in patients_df:', patients_df.columns)
-    print('Head of patients_df:', patients_df.head())
 
     print('\nResults DataFrame:')
     print(f'Shape of results_df: {results_df.shape}')
@@ -41,24 +48,13 @@ for m in models:
     print('Head of results_df:', results_df.head())
 
     ## get average response latency
-    if 'latency' in results_df.columns:
-        avg_latency = results_df['latency'].mean()
-        print(f'Average response latency: {avg_latency:.2f} seconds')
+    distinct_records = results_df.drop_duplicates(subset=['records', 'latency'])
+    avg_latency = distinct_records['latency'].mean() if 'latency' in distinct_records.columns else None
+    print(f'Average response latency for distinct records: {avg_latency:.2f} seconds' if avg_latency is not None else 'No latency data available.')
 
-    results_df = pd.merge(patients_df, results_df, on='records', how='left')
-    results_df = results_df.dropna(subset=['llm_outcome', 'gt_outcome'])
-    print('\nMerged DataFrame:')
-    print('Number of unique patients:', results_df['patientunitstayid'].nunique())
-    print('Number of unique records:', results_df['records'].nunique())
-    print('Shape of the merged DataFrame:', results_df.shape)
-    print('Head of the merged DataFrame:', results_df.head())
-    results_df.to_csv(f'{filepath}/merged_results_df_{m}.csv', index=False)
-
-    results_df['is_correct'] = np.where(results_df['llm_outcome'] == results_df['gt_outcome'], 1, 0).astype('int64')
-
-    ## get the number of encounters per outcome
+    ## get the number of encounters per outcome for the model specifically
     print('\nOutcome counts in results_df:')
-    outcome_counts = results_df['gt_outcome'].value_counts().sort_index()
+    outcome_counts = results_df['llm_outcome'].value_counts().sort_index()
     print(f'Outcome counts:\n{outcome_counts}')
 
     ## calculate accuracy, confusion matrix, AUC, sensitivity, and specificity
@@ -83,6 +79,4 @@ for m in models:
     for cls, auc in class_specific_auc.items():
         print(f'Class {cls}: AUC = {auc:.2f}')
 
-    sensitivity, specificity = calculate_sensitivity_specificity(confusion)
-    print(f'Sensitivity: {sensitivity}')
-    print(f'Specificity: {specificity}')
+    sensitivity, specificity = calculate_sensitivity_specificity(confusion, labels=classes)
