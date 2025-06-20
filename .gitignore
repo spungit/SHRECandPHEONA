@@ -1,0 +1,12 @@
+main.log
+main.aux
+main.out
+main.pdf
+main.bcf
+titlepage.aux
+main.run.xml
+main.blg
+main.bbl
+main.synctex.gz
+.DS_STORE
+.venv
