@@ -16,7 +16,7 @@ Instructions:
 3) CONCEPT CRITERIA: There are four concept categories to consider:
 
     3a) **Concept 1: Invasive Mechanical Ventilation (IMV)**
-        - **Definition**: This involves a tube in the trachea (either an endotracheal tube placed through the mouth, or rarely the nose, OR a surgically placed traheostomy tube) connected to a ventilator, delivering mechanical ventilation.
+        - **Definition**: This involves a tube in the trachea (either an endotracheal tube placed through the mouth, or rarely the nose, OR a surgically placed tracheostomy tube) connected to a ventilator, delivering mechanical ventilation.
         - **Terms and Acronyms**:
             - Terms: Endotracheal tube, tracheostomy tube, tracheostomy, trach tube, trach (either unspecified or specific to mechanical ventilation), ventilator, vent, intubated, intubation, extubation, invasive mechanical ventilation, continuous positive airway pressure, pressure support, assist control vent mode, continuous mandatory ventilation vent mode, synchronized intermittent mandatory ventilation vent mode, pressure regulated volume control vent mode, airway pressure release ventilation vent mode.
             - Acronyms: ETT or ET (endotracheal tube), IMV (invasive mechanical ventilation), CPAP (continuous positive airway pressure), PS (pressure support), AC (assist control vent mode), CMV (continuous mandatory ventilation vent mode), SIMV (synchronized intermittent mandatory ventilation vent mode), PRVC (pressure regulated volume control vent mode), APRV or Bi-level (airway pressure release ventilation vent mode)

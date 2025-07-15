@@ -8,6 +8,8 @@ import numpy as np
 import sys
 import tiktoken
 
+from filepaths import *
+
 cot_prompt = """
 INSTRUCTIONS:
 1) INPUT: The input, delimited by <input></input>, will contain a SERIES OF RECORDS from a patient's stay in the ICU. Each individual record (or row) will contain a description and will be ordered based on the occurrence of the description in the patient's stay. Each record will be in the following format: ORDER OF RECORD: <description>. **DO NOT** fabricate any information or make assumptions about the patient's records.
@@ -27,7 +29,7 @@ INSTRUCTIONS:
         - **INCLUSION CRITERIA**:
             1) At least ONE INDIVIDUAL record indicating the patient received **AT LEAST ONE** of the following medications: Specific Sedatives (Etomidate, Ketamine, Midazolam (Versed), Propofol, Dexmedetomidine (Precedex), Fentanyl, Morphine, Hydromorphone (Dilaudid), Thiopental, Cisatracurium) or Specific Paralytics (Rocuronium, Succinylcholine, Vecuronium).
             AND
-            2) At least TWO INDIVIDUAL records indicating the patient was on invasive mechanical ventilation (IMV) or intubated. **EXCLUDES** records defining ventilation settings. Invasive mechanical ventilation involves a tube in the trachea (either an endotracheal tube placed through the mouth, or rarely the nose, OR a surgically placed traheostomy tube) connected to a ventilator, delivering mechanical ventilation. Records with the following terms or acronyms should be considered for IMV unless otherwise indicated: ventilator, ETT or ET (endotracheal tube, trach tube), tracheostomy/trach,  PS (pressure support), AC (assist control vent mode), CMV (continuous mandatory ventilation vent mode), SIMV (synchronized intermittent mandatory ventilation vent mode), PRVC (pressure regulated volume control vent mode), APRV or Bi-level (airway pressure release ventilation vent mode).
+            2) At least TWO INDIVIDUAL records indicating the patient was on invasive mechanical ventilation (IMV) or intubated. **EXCLUDES** records defining ventilation settings. Invasive mechanical ventilation involves a tube in the trachea (either an endotracheal tube placed through the mouth, or rarely the nose, OR a surgically placed tracheostomy tube) connected to a ventilator, delivering mechanical ventilation. Records with the following terms or acronyms should be considered for IMV unless otherwise indicated: ventilator, ETT or ET (endotracheal tube, trach tube), tracheostomy/trach,  PS (pressure support), AC (assist control vent mode), CMV (continuous mandatory ventilation vent mode), SIMV (synchronized intermittent mandatory ventilation vent mode), PRVC (pressure regulated volume control vent mode), APRV or Bi-level (airway pressure release ventilation vent mode).
 
     - **Treatment 2: Non-Invasive Positive Pressure Ventilation (NIPPV)**
         - **INCLUSION CRITERIA**:
@@ -37,7 +39,7 @@ INSTRUCTIONS:
         - **INCLUSION CRITERIA**:
             1) The criteria for NIPPV is met where the records are **INDEPENDENT** of any records indicating HFNI or nasal cannula.
             AND
-            2) At least ONE INDIVIDUAL record indicating the patient was on high flow nasal insufflation/cannula or nasal canula. HFNI/HFNC involves oxygen delivery through a nasal cannula at a flow rate above 15 L/min, with adjustments for oxygen concentration and flow rate. Records with the following terms and acronyms should be considered HFNI/HFNC unless otherwise indicated: nasal canunla (NC), high flow nasal cannula, high flow nasal oxygen, high flow nasal insufflation, high flow nasal therapy, high flow nasal oxygen therapy, high flow nasal oxygen delivery, high flow nasal oxygen therapy (HFNOT), Optiflow, Vapotherm, Airvo.
+            2) At least ONE INDIVIDUAL record indicating the patient was on high flow nasal insufflation/cannula or nasal cannula. HFNI/HFNC involves oxygen delivery through a nasal cannula at a flow rate above 15 L/min, with adjustments for oxygen concentration and flow rate. Records with the following terms and acronyms should be considered HFNI/HFNC unless otherwise indicated: nasal cannula (NC), high flow nasal cannula, high flow nasal oxygen, high flow nasal insufflation, high flow nasal therapy, high flow nasal oxygen therapy, high flow nasal oxygen delivery, high flow nasal oxygen therapy (HFNOT), Optiflow, Vapotherm, Airvo.
         
 OUTPUT:
 <output>
@@ -157,9 +159,6 @@ def get_descriptions(prompt, unique_descriptions, data_model_name, temperature, 
     return desc_df
 
 if __name__ == "__main__":
-    model_filepath = ''
-    output_filepath = ''
-
     ## setup runtime variables
     model_name = str(sys.argv[1])
     port = str(sys.argv[2])

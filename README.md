@@ -12,6 +12,7 @@ Folder Descriptions:
 3) PHEONA for Phenotyping: Includes code to run the PHEONA evaluation tests for the phenotyping task specifically.
 4) RunClassification: Includes code to run the LLM classification of the constructed concepts.
 5) RunPhenotyping: Includes code to run the LLM phenotyping of the constructed descriptions after data has been processed following concept classification.
+6) PHEONA Reasoning Assessment: Includes code to perform the reasoning assessment for the additional reasoning component of PHEONA for the task of computational phenotyping.
 
 Run the Ollama server using the following terminal command:
 

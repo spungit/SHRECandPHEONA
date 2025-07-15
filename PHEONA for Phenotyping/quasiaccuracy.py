@@ -26,7 +26,7 @@ def calculate_sensitivity_specificity(y_true, y_pred):
     return metrics
 
 
-filepath = ''
+filepath = '/Users/spungit/Documents/Graduate School/Dissertation Work/Dissertation Work/LLM Phenotyping/Results/PhenotypingResults/EvaluationFramework/'
 
 models = ['mistralsmall24binstruct2501q80', 'gemma227binstructq80', 'phi414bq80']
 
