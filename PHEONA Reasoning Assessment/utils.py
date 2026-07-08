@@ -65,25 +65,3 @@ def get_response(prompt, record_str, data_model_name, temperature, top_p, port, 
     parsed_response = parse_response(response_content, question)
     
     return response_content, parsed_response, latency
-
-def get_final_df(input_patients_outcomes_filepath, input_classified_records_filepath):
-    pt_records = pd.read_parquet(input_patients_outcomes_filepath, columns=['patientunitstayid', 'outcome']).rename(columns={'outcome': 'gt_outcome'})
-    pt_records['patientunitstayid'] = pt_records['patientunitstayid'].astype('int64')
-    desc_records = pd.read_parquet(input_classified_records_filepath, columns=['patientunitstayid', 'ordered_string']).rename(columns={'ordered_string': 'records'})
-    desc_records['patientunitstayid'] = desc_records['patientunitstayid'].astype('int64')
-    
-    all_records = pd.merge(pt_records, desc_records, on='patientunitstayid', how='left')
-    all_records['gt_outcome'] = all_records['gt_outcome'].fillna(-1).astype('int64')
-    all_records['records'] = all_records['records'].fillna('NO RECORDS')
-    print(f'\nLoaded {len(all_records)} records.')
-    print(f'Shape of the records: {all_records.shape}')
-    print(f'Columns in the records: {all_records.columns.tolist()}')
-    print(f'Unique patientunitstayid: {all_records["patientunitstayid"].nunique()}')
-    print(f'Unique records: {all_records["records"].nunique()}')
-    print(f'Unique gt_outcome: {all_records["gt_outcome"].nunique()}')
-    print(f'Value counts of gt_outcome: {all_records["gt_outcome"].value_counts()}')
-    print(f'Number of records that are NO RECORDS: {all_records[all_records["records"] == "NO RECORDS"].shape[0]}')
-    print(f'Number of missing values across all columns: {all_records.isnull().sum().sum()}')
-    print(f'Head of the records: {all_records.head()}')
-
-    return all_records

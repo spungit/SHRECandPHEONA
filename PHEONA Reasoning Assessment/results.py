@@ -2,9 +2,11 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
 import seaborn as sns
 import tiktoken
 from scipy.stats import chi2_contingency
+from sklearn.metrics import cohen_kappa_score, balanced_accuracy_score
 
 from utils import *
 
@@ -33,6 +35,9 @@ hint_replace_dict = {
     6: -1
 }
 
+models = ['mistralsmall24binstruct2501q4KM', 'deepseekr132bqwendistillq4KM', 'phi414bq4KM']
+
+
 def check_discrete_distribution_equality(df, col1, col2):
     """
     Check if two discrete distributions are the same using Chi-Square test of independence.
@@ -58,16 +63,1072 @@ def check_discrete_distribution_equality(df, col1, col2):
 
     return chi2_stat, p_value
 
+
 def get_context_length(text, model_name="gpt-3.5-turbo"):
     tokenizer = tiktoken.encoding_for_model(model_name)
     tokens = tokenizer.encode(text)
     return len(tokens)
 
-def natural_explanationcorrectness_response_bins_plot(df, filepath):
+
+def calculate_cohen_kappa(df, col1, col2):
+    """
+    Calculate Cohen's Kappa for inter-annotator agreement between two trials of the same reviewer.
+    Assumes df has columns error_type + '_trial1' and error_type + '_trial2'
+    Returns: (kappa, lower_ci_95, upper_ci_95)
+    """
+    
+    rater1 = np.array(df[col1].tolist())
+    rater2 = np.array(df[col2].tolist())
+    
+    # Check if both columns contain only a single unique label
+    unique_rater1 = np.unique(rater1)
+    unique_rater2 = np.unique(rater2)
+    
+    if len(unique_rater1) == 1 and len(unique_rater2) == 1:
+        # Both raters only have one label
+        if unique_rater1[0] == unique_rater2[0]:
+            # Same single label - perfect agreement
+            return 1.0, 1.0, 1.0
+        else:
+            # Different single labels - perfect disagreement
+            return -1.0, -1.0, -1.0
+    
+    # Calculate kappa
+    kappa = cohen_kappa_score(rater1, rater2)
+    
+    # # Bootstrap confidence intervals
+    # n_bootstrap = 10000
+    # kappas_bootstrap = []
+    # n_samples = len(rater1)
+    
+    # np.random.seed(42)
+    # for _ in range(n_bootstrap):
+    #     indices = np.random.choice(n_samples, n_samples, replace=True)
+    #     kappa_boot = cohen_kappa_score(rater1[indices], rater2[indices])
+    #     kappas_bootstrap.append(kappa_boot)
+    
+    # # Calculate 95% CI
+    # lower_ci = np.percentile(kappas_bootstrap, 2.5)
+    # upper_ci = np.percentile(kappas_bootstrap, 97.5)
+
+    lower_ci = 0
+    upper_ci = 1
+    
+    return kappa, lower_ci, upper_ci
+
+
+def plot_inter_annotator_agreement_heatmap_panel(df, FILEPATH, show_plots=False):
+    """
+    Create a 3-panel figure for inter-annotator agreement by error type.
+    Each panel shows a lower-triangle heatmap with reviewer axes and hierarchical
+    model/COT labels so each model has No CoT, Some CoT, and Full CoT in one panel.
+    """
+    error_groups = [
+        ('explanationcorrectness', 'Explanation Correctness Errors'),
+        ('unfaithfulshortcut_error', 'Unfaithful Shortcut Errors'),
+        ('restoration_error', 'Restoration Errors'),
+    ]
+    model_order = ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM']
+    model_labels = {
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'phi414bq4KM': 'Phi'
+    }
+    cot_order = ['nocot', 'somecot', 'fullcot']
+    cot_labels = {'nocot': 'No CoT', 'somecot': 'Some CoT', 'fullcot': 'Full CoT'}
+    categories = [(model, cot) for model in model_order for cot in cot_order]
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, 8), constrained_layout=True, sharey=True)
+    fig.subplots_adjust(bottom=0.28)
+
+    # Kappa buckets and colors (standard interpretation)
+    buckets = [(-1.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 0.9), (0.9, 1.0)]
+    bucket_labels = ['None', 'Minimal', 'Weak', 'Moderate', 'Strong', 'Almost Perfect']
+    # match project colors: blend from light grey to main error color '#ac2e44'
+    palette = sns.blend_palette(['#d3d3d3', '#ac2e44'], n_colors=len(buckets))
+
+    def _bucket_color(val):
+        if np.isnan(val):
+            return '#d3d3d3'
+        for b, color in zip(buckets, palette):
+            if b[0] <= val <= b[1]:
+                return color
+        return palette[-1]
+
+    # Precompute global x positions and common y-limits across panels
+    n_models = len(model_order)
+    n_cots = len(cot_order)
+    xs_global = np.arange(n_models * n_cots)
+    categories = [(model, cot) for model in model_order for cot in cot_order]
+
+    # compute global y-limits from available CI bounds so negative error bars are included
+    all_lows = []
+    all_highs = []
+    for error_key, _ in error_groups:
+        ed = df[df['error_name'].str.contains(error_key, case=False, na=False)].copy()
+        for _, r in ed.iterrows():
+            if not pd.isna(r.get('lower_95_ci')):
+                all_lows.append(float(r['lower_95_ci']))
+            if not pd.isna(r.get('upper_95_ci')):
+                all_highs.append(float(r['upper_95_ci']))
+    if len(all_lows) and len(all_highs):
+        global_ymax = max(all_highs)
+        margin = max(0.05 * global_ymax, 0.02)
+        global_ylim = (0.0, global_ymax + margin)
+    else:
+        global_ylim = (0.0, 1.0)
+
+    for ax, (error_key, title) in zip(axes, error_groups):
+        error_df = df[df['error_name'].str.contains(error_key, case=False, na=False)].copy()
+
+        # build plotting table
+        rows = []
+        for model in model_order:
+            for cot in cot_order:
+                match = error_df[(error_df['model'] == model) & (error_df['error_name'].str.contains(cot, case=False, na=False))]
+                if not match.empty:
+                    k = float(match['cohens_kappa'].values[0])
+                    lo = float(match['lower_95_ci'].values[0])
+                    hi = float(match['upper_95_ci'].values[0])
+                else:
+                    k, lo, hi = np.nan, np.nan, np.nan
+                rows.append({'model': model, 'cot': cot, 'kappa': k, 'lo': lo, 'hi': hi})
+
+        plot_df = pd.DataFrame(rows)
+
+        # make bars thick and leave a small gap between model groups
+        bar_width = 1.0
+        group_gap = 0.8
+
+        xs = []
+        heights = []
+        yerr = [[], []]
+        colors = []
+
+        for m_i, model in enumerate(model_order):
+            base = m_i * (n_cots + group_gap)
+            for c_i, cot in enumerate(cot_order):
+                x = base + c_i
+                xs.append(x)
+                row = plot_df[(plot_df['model'] == model) & (plot_df['cot'] == cot)].iloc[0]
+                heights.append(row['kappa'])
+                if np.isnan(row['kappa']):
+                    yerr[0].append(0)
+                    yerr[1].append(0)
+                else:
+                    yerr[0].append(row['kappa'] - row['lo'])
+                    yerr[1].append(row['hi'] - row['kappa'])
+                colors.append(_bucket_color(row['kappa']))
+
+        xs = np.array(xs)
+        heights = np.array(heights, dtype=float)
+
+        # Add grey borders (no error bars) to match natural_plot appearance
+        bars = ax.bar(
+            xs, heights, width=bar_width,
+            color=colors, edgecolor='#3a414a', align='center'
+        )
+
+        # X-axis: CoT labels at the bar positions, model group labels below
+        ax.set_xticks(xs)
+        ax.set_xticklabels([cot_labels[cot] for _, cot in categories], rotation=90, ha='center', fontsize=20, color='#3a414a')
+        ax.tick_params(axis='x', which='both', length=0, pad=4)
+        ax.xaxis.set_ticks_position('none')
+
+        # add explicit model labels centered under the middle CoT bar for each model
+        for m_i, model in enumerate(model_order):
+            group_start = m_i * n_cots
+            middle_index = group_start + n_cots // 2
+            if middle_index >= len(xs):
+                continue
+            group_center = xs[middle_index]
+            ax.text(
+                group_center,
+                -0.275,
+                model_labels[model],
+                transform=ax.get_xaxis_transform(),
+                ha='center',
+                va='top',
+                fontsize=22,
+                fontweight='bold',
+                color='#3a414a',
+                clip_on=False
+            )
+
+        # enforce shared y-limits across all panels (includes CI bounds)
+        ax.set_ylim(global_ylim)
+        ax.set_title(title, fontsize=22, fontweight='bold', color='#3a414a')
+        # horizontal gridlines similar to other plots
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.0, alpha=0.6)
+        ax.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
+        ax.yaxis.set_minor_locator(AutoMinorLocator())
+        ax.xaxis.set_minor_locator(plt.NullLocator())
+
+        # ensure x-limits include full bars and leave room for labels
+        ax.set_xlim(xs.min() - bar_width, xs.max() + bar_width)
+
+        # collect legend handles once (will add to right-most axis later)
+        handles = [plt.Rectangle((0, 0), 1, 1, color=palette[i]) for i in range(len(buckets))]
+        legend_handles = handles
+
+    # remove all but left-most y-axis labels
+    for i, ax in enumerate(axes):
+        if i > 0:
+            ax.set_ylabel('')
+            ax.tick_params(labelleft=False)
+        else:
+            ax.set_ylabel("Cohen's Kappa Coefficient", fontsize=22)
+            ax.tick_params(labelsize=20)
+
+    # place legend inside the upper-right corner of the right-most subplot
+    axes[0].legend(legend_handles, bucket_labels, title='Agreement', loc='upper left', fontsize=17, title_fontsize=17)
+    if FILEPATH is not None:
+        output_path = os.fspath(FILEPATH)
+        base, ext = os.path.splitext(output_path)
+        if ext.lower() in {'.png', '.svg'}:
+            save_dir = os.path.dirname(output_path) or '.'
+            filename = os.path.basename(base)
+        else:
+            save_dir = output_path
+            filename = 'inter_annotator_agreement_panel'
+
+        if os.path.exists(save_dir) and not os.path.isdir(save_dir):
+            raise FileExistsError(f'Output directory path exists as a file: {save_dir}')
+        os.makedirs(save_dir, exist_ok=True)
+
+        prefix = os.path.join(save_dir, filename)
+        plt.savefig(prefix + '.png', dpi=300, bbox_inches='tight')
+        plt.savefig(prefix + '.svg', bbox_inches='tight')
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def natural_plot(df_expl, df_unfaithful, df_restore, filename, error_titles=None, show_plots=show_plots):
+    """
+    Plot three error types side-by-side. Each subplot shows the three CoT
+    values (No/Some/Full) averaged across trials for each model with standard
+    deviation error bars. Produces a single legend and a single shared y-axis.
+
+    Args:
+        df (pd.DataFrame): trial-level data with columns like
+            'nocot_<suffix>', 'somecot_<suffix>', 'fullcot_<suffix>' and a
+            `model` column matching the expected model codes.
+        error_suffixes (list[str]): list of three suffixes, e.g.
+            ['explanationcorrectness_error','restoration_error','unfaithfulshortcut_error']
+        filename (str): output filename (without extension) or path prefix.
+        error_titles (list[str], optional): display titles for the three panels.
+        show_plots (bool): whether to call `plt.show()`.
+    """
+
+    # Accept three dataframes: explanation correctness, unfaithful shortcut, restoration
+    dfs = [df_expl, df_unfaithful, df_restore]
+    # derive suffix for each df by finding a column that starts with 'nocot_'
+    error_suffixes = []
+    for d in dfs:
+        suffix = None
+        for col in d.columns:
+            if col.startswith('nocot_'):
+                suffix = col.replace('nocot_', '')
+                break
+        if suffix is None:
+            # fallback: try somecot_
+            for col in d.columns:
+                if col.startswith('somecot_'):
+                    suffix = col.replace('somecot_', '')
+                    break
+        if suffix is None:
+            raise ValueError('Could not detect error column suffix in one of the provided DataFrames')
+        error_suffixes.append(suffix)
+
+    if error_titles is None:
+        default_titles = {
+            error_suffixes[0]: 'Explanation Correctness Errors',
+            error_suffixes[1]: 'Unfaithful Shortcut Errors',
+            error_suffixes[2]: 'Restoration Errors'
+        }
+        error_titles = [default_titles.get(s, s) for s in error_suffixes]
+
+    # expected model identifiers in the data
+    model_codes = ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM']
+    display_names = {'deepseekr132bqwendistillq4KM': 'DeepSeek',
+                     'mistralsmall24binstruct2501q4KM': 'Mistral',
+                     'phi414bq4KM': 'Phi'}
+
+    colors = {'DeepSeek': '#b44357', 'Mistral': '#264851', 'Phi': '#72ccae'}
+    cot_keys = ['nocot', 'somecot', 'fullcot']
+    cot_labels = ['No CoT', 'Some CoT', 'Full CoT']
+
+    n_panels = len(error_suffixes)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 6), constrained_layout=True, sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    # compute statistics for all combinations
+    stats = {}
+    all_means = []
+    all_stds = []
+    for suffix, d in zip(error_suffixes, dfs):
+        stats[suffix] = {}
+        for code in model_codes:
+            means = []
+            stds = []
+            for cot in cot_keys:
+                col = f"{cot}_{suffix}"
+                if col in d.columns:
+                    vals = pd.to_numeric(d.loc[d['model'] == code, col], errors='coerce').dropna().values
+                else:
+                    vals = np.array([])
+                if vals.size > 0:
+                    means.append(float(np.mean(vals)))
+                    stds.append(float(np.std(vals, ddof=0)))
+                else:
+                    means.append(np.nan)
+                    stds.append(0.0)
+            stats[suffix][code] = (np.array(means), np.array(stds))
+            all_means.extend([m for m in means if not np.isnan(m)])
+            all_stds.extend(stds)
+
+    # determine y-limits
+    if len(all_means):
+        y_max = max(all_means) + max(all_stds)
+        y_max *= 1.08
+    else:
+        y_max = 1.0
+
+    # Plot: each panel is an error type; within panel, grouped bars per CoT with one bar per model
+    model_handles = []
+    model_labels = []
+    hatch_types = ['///', None, '\\\\']
+    n_models = len(model_codes)
+    x = np.arange(len(cot_keys))
+    width = 0.22
+    for ax_idx, (ax, suffix, title) in enumerate(zip(axes, error_suffixes, error_titles)):
+        for i, code in enumerate(model_codes):
+            display = display_names.get(code, code)
+            means, stds = stats[suffix][code]
+            color = colors.get(display, '#333333')
+            offset = (i - (n_models - 1) / 2.0) * width
+            rects = ax.bar(x + offset, means, width, yerr=stds, capsize=7,
+                           color=color, edgecolor='#3a414a', hatch=hatch_types[i], align='center',
+                           error_kw={'linewidth': 3.0, 'capthick': 3.0})
+            # collect one handle per model from the first axis for a shared legend
+            if ax is axes[0]:
+                model_handles.append(rects[0])
+                model_labels.append(display)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(cot_labels, fontsize=20, color='#3a414a')
+        ax.set_title(title, fontsize=22, fontweight='bold', color='#3a414a')
+        # only set x-axis title on the middle plot
+        if ax_idx == 1:
+            ax.set_xlabel('CoT Type', fontsize=22, color='#3a414a')
+        ax.set_ylim(0, max(1.0, y_max))
+        # gridlines similar to other plots
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.9)
+        ax.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.6)
+        ax.yaxis.set_minor_locator(AutoMinorLocator())
+        ax.xaxis.set_minor_locator(plt.NullLocator())
+
+    # shared y-axis label on left-most plot only
+    axes[0].set_ylabel('Average Number of Responses', fontsize=22, color='#3a414a')
+    axes[0].tick_params(axis='y', labelsize=20)
+    for ax in axes[1:]:
+        ax.tick_params(labelleft=False)
+
+    # single legend placed in the top-right of the right-most subplot
+    axes[-1].legend(model_handles, model_labels, loc='upper right', ncol=len(model_labels), fontsize=16, title_fontsize=16, title='Model')
+
+    plt.savefig(f"{filename}.png", dpi=600, bbox_inches='tight')
+    plt.savefig(f"{filename}.svg", bbox_inches='tight')
+    if show_plots:
+        plt.show()
+
+
+def get_simulated_iscorrect(df):
+    df['outcome'] = df['outcome'].astype(int)
+
+    cot_types = ['nocot', 'somecot', 'fullcot']
+    example_types = ['randomfewshot', 'specificfewshot']
+    hint_types = ['nohint', 'hint']
+
+    iscorrect_colnames = []
+    outcome_colnames = []
+    for cot in cot_types:
+        for example in example_types:
+            for hint in hint_types:
+                df[f'{cot}_{example}_{hint}_parsed_response'] = df[f'{cot}_{example}_{hint}_parsed_response'].astype(int)
+                colname = f'iscorrect_{cot}_{example}_{hint}'
+                df[colname] = np.where(df[f'{cot}_{example}_{hint}_parsed_response'] == df['outcome'], 1, 0)
+                iscorrect_colnames.append(colname)
+                outcome_colnames.append(f'{cot}_{example}_{hint}_parsed_response')
+
+    additional_columns = [
+        'nocot_parsed_response', 'somecot_parsed_response', 'fullcot_parsed_response',
+        'nocot_noexamples_hint_parsed_response', 'somecot_noexamples_hint_parsed_response', 'fullcot_noexamples_hint_parsed_response'
+    ]
+    df[additional_columns] = df[additional_columns].astype(int)
+    for col in additional_columns:
+        outcome_colnames.append(col)
+        colname = f'iscorrect_{col}'
+        iscorrect_colnames.append(colname)
+        df[colname] = np.where(df[col] == df['outcome'], 1, 0)
+
+    return df, iscorrect_colnames, outcome_colnames
+
+
+def draw_vertical_pathway(ax, x, y_vals, color='#b0b0b0', alpha=0.25, text_color='#3a414a', diff_bold_color='#ac2e44'):
+    y_vals_sorted = sorted(y_vals, key=lambda tup: tup[1], reverse=True)
+    if len(y_vals_sorted) >= 2:
+        y_poly = [y for _, y, *_ in y_vals_sorted]
+        ax.fill_betweenx(y_poly, x-0.18, x+0.18, color=color, alpha=alpha, zorder=1)
+        for i in range(len(y_vals_sorted)-1):
+            y0 = y_vals_sorted[i][1]
+            y1 = y_vals_sorted[i+1][1]
+            # Removed the vertical line: ax.plot([x, x], [y0, y1], color=color, alpha=0.7, zorder=2)
+            diff = y0 - y1
+            ym = (y0 + y1) / 2
+    for label, y, c, m, z in y_vals_sorted:
+        ax.scatter(x, y, label=label, color=c, marker=m, s=750, zorder=z)
+
+
+def simulated_plot(df, filepath, show_plots=True):
+    custom_color = '#3a414a'
+    diff_bold_color = '#ac2e44'
+
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
+    }
+
+    cot_type_order = ['nocot', 'somecot', 'fullcot']
+    cot_type_labels = ['No CoT', 'Some CoT', 'Full CoT']
+    cot_type_map = {k: i for i, k in enumerate(cot_type_order)}
+
+    def get_column_value(df_model, candidates):
+        for col in candidates:
+            if col in df_model.columns:
+                val = df_model[col].iloc[0]
+                if pd.notna(val):
+                    return float(val)
+        return np.nan
+
+    models = df['model'].unique()
+    fig, axes = plt.subplots(len(models), 3, figsize=(18, 5 * len(models)), sharex='col', constrained_layout=True)
+    if len(models) == 1:
+        axes = [axes]
+
+    # Legend handles
+    legend_elements_random = [
+        plt.Line2D([0], [0], marker='h', color='w', label='RandomFewShot + Hint', markerfacecolor='#ac2e44', markersize=28),
+        plt.Line2D([0], [0], marker='p', color='w', label='RandomFewShot + NoHint', markerfacecolor='#0e343e', markersize=28),
+        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=28)
+    ]
+    legend_elements_specific = [
+        plt.Line2D([0], [0], marker='h', color='w', label='SpecificFewShot + Hint', markerfacecolor='#ac2e44', markersize=28),
+        plt.Line2D([0], [0], marker='p', color='w', label='SpecificFewShot + NoHint', markerfacecolor='#0e343e', markersize=28),
+        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=28)
+    ]
+    legend_elements_panel3 = [
+        plt.Line2D([0], [0], marker='h', color='w', label='Hint Only', markerfacecolor='#ac2e44', markersize=28),
+        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=28)
+    ]
+
+    # --- 1. Gather all y-values for all panels ---
+    all_yvals = []
+    for model in models:
+        df_model = df[df['model'] == model]
+        if df_model.empty:
+            continue
+
+        for cot in cot_type_order:
+            values = [
+                get_column_value(df_model, [f'iscorrect_{cot}_randomfewshot_hint', f'iscorrect_{cot}_randomfewshot_hint_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_randomfewshot_nohint', f'iscorrect_{cot}_randomfewshot_nohint_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_specificfewshot_hint', f'iscorrect_{cot}_specificfewshot_hint_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_specificfewshot_nohint', f'iscorrect_{cot}_specificfewshot_nohint_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_parsed_response']),
+                get_column_value(df_model, [f'iscorrect_{cot}_noexamples_hint_parsed_response', f'iscorrect_{cot}_noexamples_hint'])
+            ]
+            all_yvals.extend([v for v in values if not np.isnan(v)])
+
+    ## uncomment for regular accuracy
+    if all_yvals:
+        global_min = min(all_yvals) - 0.025
+        global_max = max(all_yvals) + 0.05
+    else:
+        global_min, global_max = 0, 0.48
+    global_max = max(0.48, global_max)
+    # global_min, global_max = 0.10, 0.225
+
+    # --- 2. Plot using averaged values from df ---
+    for idx, model in enumerate(models):
+        df_model = df[df['model'] == model]
+        if df_model.empty:
+            continue
+
+        ax1 = axes[idx][0] if len(models) > 1 else axes[0]
+        ax2 = axes[idx][1] if len(models) > 1 else axes[1]
+        ax3 = axes[idx][2] if len(models) > 1 else axes[2]
+
+        # PANEL 1: RANDOM FEW SHOT
+        ax1.set_axisbelow(True)
+        ax1.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
+        ax1.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
+        ax1.xaxis.grid(False)
+        ax1.minorticks_on()
+
+        for cot in cot_type_order:
+            x = cot_type_map[cot]
+            yvals = []
+            hint_val = get_column_value(df_model, [f'iscorrect_{cot}_randomfewshot_hint', f'iscorrect_{cot}_randomfewshot_hint_parsed_response'])
+            nohint_val = get_column_value(df_model, [f'iscorrect_{cot}_randomfewshot_nohint', f'iscorrect_{cot}_randomfewshot_nohint_parsed_response'])
+            unbiased_val = get_column_value(df_model, [f'iscorrect_{cot}_parsed_response'])
+            if not np.isnan(hint_val):
+                yvals.append(('RandomFewShot + Hint', hint_val, '#ac2e44', 'h', 4))
+            if not np.isnan(nohint_val):
+                yvals.append(('RandomFewShot + NoHint', nohint_val, '#0e343e', 'p', 4))
+            if not np.isnan(unbiased_val):
+                yvals.append(('Unbiased', unbiased_val, '#72ccae', '8', 5))
+            if yvals:
+                draw_vertical_pathway(ax1, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
+
+        ax1.set_ylabel('Accuracy', color=custom_color, fontsize=22)
+        ax1.tick_params(axis='x', colors=custom_color, labelsize=20)
+        ax1.tick_params(axis='y', colors=custom_color, labelsize=20)
+        ax1.set_xticks([cot_type_map[c] for c in cot_type_order])
+        ax1.set_xticklabels(cot_type_labels, color=custom_color, fontsize=22)
+        plt.setp(ax1.get_yticklabels(), color=custom_color, fontsize=22)
+        for spine in ax1.spines.values():
+            spine.set_color(custom_color)
+        ax1.set_ylim(global_min, global_max)
+        if idx == 0:
+            ax1.legend(handles=legend_elements_random, loc='upper left', fontsize=18)
+
+        # PANEL 2: SPECIFIC FEW SHOT
+        ax2.set_axisbelow(True)
+        ax2.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
+        ax2.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
+        ax2.xaxis.grid(False)
+        ax2.minorticks_on()
+
+        for cot in cot_type_order:
+            x = cot_type_map[cot]
+            yvals = []
+            hint_val = get_column_value(df_model, [f'iscorrect_{cot}_specificfewshot_hint', f'iscorrect_{cot}_specificfewshot_hint_parsed_response'])
+            nohint_val = get_column_value(df_model, [f'iscorrect_{cot}_specificfewshot_nohint', f'iscorrect_{cot}_specificfewshot_nohint_parsed_response'])
+            unbiased_val = get_column_value(df_model, [f'iscorrect_{cot}_parsed_response'])
+            if not np.isnan(hint_val):
+                yvals.append(('SpecificFewShot + Hint', hint_val, '#ac2e44', 'h', 4))
+            if not np.isnan(nohint_val):
+                yvals.append(('SpecificFewShot + NoHint', nohint_val, '#0e343e', 'p', 4))
+            if not np.isnan(unbiased_val):
+                yvals.append(('Unbiased', unbiased_val, '#72ccae', '8', 5))
+            if yvals:
+                draw_vertical_pathway(ax2, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
+
+        ax2.tick_params(axis='x', colors=custom_color, labelsize=20)
+        ax2.tick_params(axis='y', colors=custom_color, labelsize=20)
+        ax2.set_xticks([cot_type_map[c] for c in cot_type_order])
+        ax2.set_xticklabels(cot_type_labels, color=custom_color, fontsize=20)
+        plt.setp(ax2.get_yticklabels(), color=custom_color, fontsize=20)
+        for spine in ax2.spines.values():
+            spine.set_color(custom_color)
+        ax2.set_ylim(global_min, global_max)
+        if idx == 0:
+            ax2.legend(handles=legend_elements_specific, loc='upper left', fontsize=18)
+
+        # PANEL 3: UNBIASED VS HINT-ONLY (no examples)
+        ax3.set_axisbelow(True)
+        ax3.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
+        ax3.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
+        ax3.xaxis.grid(False)
+        ax3.minorticks_on()
+
+        for cot in cot_type_order:
+            x = cot_type_map[cot]
+            yvals = []
+            unbiased_val = get_column_value(df_model, [f'iscorrect_{cot}_parsed_response'])
+            hint_only_val = get_column_value(df_model, [f'iscorrect_{cot}_noexamples_hint_parsed_response', f'iscorrect_{cot}_noexamples_hint'])
+            if not np.isnan(unbiased_val):
+                yvals.append(('Unbiased', unbiased_val, '#72ccae', '8', 5))
+            if not np.isnan(hint_only_val):
+                yvals.append(('Hint Only', hint_only_val, '#ac2e44', 'h', 4))
+            if yvals:
+                draw_vertical_pathway(ax3, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
+
+        ax3.tick_params(axis='x', colors=custom_color, labelsize=20)
+        ax3.tick_params(axis='y', colors=custom_color, labelsize=20)
+        ax3.set_xticks([cot_type_map[c] for c in cot_type_order])
+        ax3.set_xticklabels(cot_type_labels, color=custom_color, fontsize=20)
+        plt.setp(ax3.get_yticklabels(), color=custom_color, fontsize=20)
+        for spine in ax3.spines.values():
+            spine.set_color(custom_color)
+        ax3.set_ylim(global_min, global_max)
+        if idx == 0:
+            ax3.legend(handles=legend_elements_panel3, loc='upper left', fontsize=18)
+
+        ax_for_label = ax3
+        ylim = ax_for_label.get_ylim()
+        ymid = (ylim[0] + ylim[1]) / 2
+        ax_for_label.text(
+            1.04, ymid, model_names_to_display.get(model, ''),
+            color=custom_color, fontsize=22, fontweight='bold',
+            va='center', ha='left', rotation=270,
+            transform=ax_for_label.get_yaxis_transform()
+        )
+
+        # Hide y-axis on middle and right panels for this model row
+        ax2.set_ylabel('')
+        ax2.tick_params(axis='y', labelleft=False, left=False, right=False)
+        ax2.spines['left'].set_visible(True)
+        
+        ax3.set_ylabel('')
+        ax3.tick_params(axis='y', labelleft=False, left=False, right=False)
+        ax3.spines['left'].set_visible(True)
+
+    for row in axes:
+        for ax in row:
+            ax.set_xlabel('')
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.075)
+    fig.text(0.5, 0.03, 'CoT Type', ha='center', va='center', fontsize=22, color=custom_color)
+
+    plt.savefig(filepath + "simulated_errors_plot.png", dpi=300)
+    plt.savefig(filepath + "simulated_errors_plot.svg")
+    if show_plots:
+        plt.show()
+
+
+RESULTS_FILEPATH = ''
+INDIVIDUAL_FILEPATH = '/individual_reviewers/'
+MODELS = ['phi414bq4KM', 'mistralsmall24binstruct2501q4KM', 'deepseekr132bqwendistillq4KM']
+
+SKIP_COHENS_KAPPA = False
+
+if not SKIP_COHENS_KAPPA:
+    ## calculate inter-annotator agreement for error annotations (after converting to binary error/no error labels)
+    all_rater_data = []
+
+    print('\n-----------------------------------------------\n')
+    print('Explanation correctness inter-annotator agreement calculation:\n')
+    explanation_correctness_raters = ['SP', 'SY']
+
+    all_explanation_correctness_df = pd.DataFrame()  # Initialize empty DataFrame to store all explanation correctness annotations across models and raters
+
+    for m in MODELS:
+        rater_data = pd.DataFrame()  # Initialize empty DataFrame to store rater annotations for this model
+        for n_rater, rater_name in enumerate(explanation_correctness_raters):
+            explanationcorrectness_filename = f'explanation_correctness_{m}_{rater_name}.xlsx'
+            explanationcorrectness_filepath = INDIVIDUAL_FILEPATH + explanationcorrectness_filename
+            print(f'Checking for file: {explanationcorrectness_filepath}')
+            if os.path.exists(explanationcorrectness_filepath):
+                explanationcorrectness_df = pd.read_excel(explanationcorrectness_filepath)
+                print(f'\nLoaded file: {explanationcorrectness_filepath} with shape {explanationcorrectness_df.shape}')
+                print(f'Columns in the file: {explanationcorrectness_df.columns.tolist()}')
+                print(explanationcorrectness_df.head())
+                explanationcorrectness_df['model'] = m  # Add model column to the explanation correctness DataFrame
+                explanationcorrectness_df['trial'] = explanationcorrectness_df['trial'].astype(int) + 3 * n_rater  # Adjust trial numbers to be unique across raters (assuming each rater has 3 trials
+                all_explanation_correctness_df = pd.concat([all_explanation_correctness_df, explanationcorrectness_df], ignore_index=True)  # Append to master DataFrame
+                rater_data[f'nocot_explanationcorrectness_{n_rater+1}'] = explanationcorrectness_df['nocot_explanationcorrectness_error'].astype(int)
+                rater_data[f'somecot_explanationcorrectness_{n_rater+1}'] = explanationcorrectness_df['somecot_explanationcorrectness_error'].astype(int)
+                rater_data[f'fullcot_explanationcorrectness_{n_rater+1}'] = explanationcorrectness_df['fullcot_explanationcorrectness_error'].astype(int)
+            else:
+                print(f'Explanation correctness file not found for model {m}. Skipping inter-annotator agreement calculation.')
+
+        print(f'\nConstructed rater DataFrame for model {m} with shape {rater_data.shape} and columns: {rater_data.columns.tolist()}')
+        print(f'Rater DataFrame head for model {m}:\n{rater_data.head()}')
+
+        for error_type in ['nocot_explanationcorrectness', 'somecot_explanationcorrectness', 'fullcot_explanationcorrectness']:
+            print(f'\nCalculating Cohen\'s Kappa for {error_type} in model {m} using columns: {f"{error_type}_1"} and {f"{error_type}_2"}')
+            kappa, lower_ci, upper_ci = calculate_cohen_kappa(rater_data, f'{error_type}_1', f'{error_type}_2')
+            print(f'Inter-annotator agreement (Cohen\'s Kappa) for {error_type} in model {m}: {kappa:.3f} (95% CI: {lower_ci:.3f} - {upper_ci:.3f})')
+            row = {'model': m, 'error_name': error_type, 'cohens_kappa': kappa, 'lower_95_ci': lower_ci, 'upper_95_ci': upper_ci}
+            all_rater_data.append(row)
+
+
+    print('\n-----------------------------------------------\n')
+    print('Unfaithful shortcut and restoration error inter-annotator agreement calculation:\n')
+    unfaithful_restoration_errors_raters = ['SP', 'DM']
+
+    all_unfaithful_restoration_errors_df = pd.DataFrame()  # Initialize empty DataFrame to store all unfaithful shortcut and restoration error annotations across models and raters
+
+    for m in MODELS:
+        rater_data = pd.DataFrame()  # Initialize empty DataFrame to store rater annotations for this model
+        for n_rater, rater_name in enumerate(unfaithful_restoration_errors_raters):
+            unfaithful_restoration_filename = f'restoration_unfaithful_{m}_{rater_name}.xlsx'
+            unfaithful_restoration_filepath = INDIVIDUAL_FILEPATH + unfaithful_restoration_filename
+            print(f'Checking for file: {unfaithful_restoration_filepath}')
+            if os.path.exists(INDIVIDUAL_FILEPATH + unfaithful_restoration_filename):
+                unfaithful_restoration_df = pd.read_excel(unfaithful_restoration_filepath)
+                print(f'\nLoaded file: {unfaithful_restoration_filepath} with shape {unfaithful_restoration_df.shape}')
+                print(f'Columns in the file: {unfaithful_restoration_df.columns.tolist()}')
+                print(unfaithful_restoration_df.head())
+                unfaithful_restoration_df['model'] = m  # Add model column to the unfaithful/restoration DataFrame
+                unfaithful_restoration_df['trial'] = unfaithful_restoration_df['trial'].astype(int) + 3 * n_rater
+                all_unfaithful_restoration_errors_df = pd.concat([all_unfaithful_restoration_errors_df, unfaithful_restoration_df], ignore_index=True)  # Append to master DataFrame
+                rater_data[f'nocot_unfaithfulshortcut_error_{n_rater+1}'] = unfaithful_restoration_df['nocot_unfaithfulshortcut_error'].astype(int)
+                rater_data[f'somecot_unfaithfulshortcut_error_{n_rater+1}'] = unfaithful_restoration_df['somecot_unfaithfulshortcut_error'].astype(int)
+                rater_data[f'fullcot_unfaithfulshortcut_error_{n_rater+1}'] = unfaithful_restoration_df['fullcot_unfaithfulshortcut_error'].astype(int)
+                rater_data[f'nocot_restoration_error_{n_rater+1}'] = unfaithful_restoration_df['nocot_restoration_error'].astype(int)
+                rater_data[f'somecot_restoration_error_{n_rater+1}'] = unfaithful_restoration_df['somecot_restoration_error'].astype(int)
+                rater_data[f'fullcot_restoration_error_{n_rater+1}'] = unfaithful_restoration_df['fullcot_restoration_error'].astype(int)
+            else:
+                print(f'Unfaithful shortcut error file not found for model {m}. Skipping inter-annotator agreement calculation.')
+
+        print(f'\nConstructed rater DataFrame for model {m} with shape {rater_data.shape} and columns: {rater_data.columns.tolist()}')
+        print(f'Rater DataFrame head for model {m}:\n{rater_data.head()}')
+
+        for error_type in ['nocot_unfaithfulshortcut_error', 'somecot_unfaithfulshortcut_error', 'fullcot_unfaithfulshortcut_error', 'nocot_restoration_error', 'somecot_restoration_error', 'fullcot_restoration_error']:
+            if f'{error_type}_1' not in rater_data.columns or f'{error_type}_2' not in rater_data.columns:
+                print(f'Columns for {error_type} not found in rater data for model {m}. Skipping Cohen\'s Kappa calculation for this error type.')
+                continue
+            print(f'\nCalculating Cohen\'s Kappa for {error_type} in model {m} using columns: {f"{error_type}_1"} and {f"{error_type}_2"}')
+            kappa, lower_ci, upper_ci = calculate_cohen_kappa(rater_data, f'{error_type}_1', f'{error_type}_2')
+            print(f'Inter-annotator agreement (Cohen\'s Kappa) for {error_type} in model {m}: {kappa:.3f} (95% CI: {lower_ci:.3f} - {upper_ci:.3f})')
+            row = {'model': m, 'error_name': error_type, 'cohens_kappa': kappa, 'lower_95_ci': lower_ci, 'upper_95_ci': upper_ci}
+            all_rater_data.append(row)
+
+    all_rater_data = pd.DataFrame(all_rater_data)
+    print('\n\nAll inter-annotator agreement results:')
+    print(all_rater_data)
+    all_rater_data.to_excel(RESULTS_FILEPATH + 'inter_annotator_agreement_results.xlsx', index=False)
+
+    plot_inter_annotator_agreement_heatmap_panel(all_rater_data, RESULTS_FILEPATH + 'inter_annotator_agreement_heatmap_panel.png', show_plots=True)
+
+    all_explanation_correctness_df.to_excel(RESULTS_FILEPATH + 'all_explanation_correctness_annotations.xlsx', index=False)
+    all_unfaithful_restoration_errors_df.to_excel(RESULTS_FILEPATH + 'all_unfaithful_restoration_annotations.xlsx', index=False)
+
+else:
+    all_explanation_correctness_df = pd.read_excel(RESULTS_FILEPATH + 'all_explanation_correctness_annotations.xlsx')
+    all_unfaithful_restoration_errors_df = pd.read_excel(RESULTS_FILEPATH + 'all_unfaithful_restoration_annotations.xlsx')
+
+## Natural Analysis ##
+## explanation correctness df details
+print('\n-----------------------------------------------\n')
+print('Explanation correctness df details:\n')
+print(f'Columns in explanation correctness DataFrame: {all_explanation_correctness_df.columns.tolist()}')
+print(all_explanation_correctness_df.head())
+
+## unfaithful shortcut and restoration error df details
+print('\n-----------------------------------------------\n')
+print('Unfaithful shortcut and restoration error df details:\n')
+print(f'Columns in unfaithful shortcut and restoration error DataFrame: {all_unfaithful_restoration_errors_df.columns.tolist()}')
+print(all_unfaithful_restoration_errors_df.head())
+
+## tokens in responses and descriptions details
+all_explanation_correctness_df['n_tokens_nocot_response'] = all_explanation_correctness_df['nocot_response'].apply(lambda x: get_context_length(x))
+all_explanation_correctness_df['n_tokens_somecot_response'] = all_explanation_correctness_df['somecot_response'].apply(lambda x: get_context_length(x))
+all_explanation_correctness_df['n_tokens_fullcot_response'] = all_explanation_correctness_df['fullcot_response'].apply(lambda x: get_context_length(x))
+all_explanation_correctness_df['n_tokens_description'] = all_explanation_correctness_df['description'].apply(lambda x: get_context_length(x))
+
+all_explanation_correctness_df['n_tokens_nocot_response_group'] = pd.cut(all_explanation_correctness_df['n_tokens_nocot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_explanation_correctness_df['n_tokens_somecot_response_group'] = pd.cut(all_explanation_correctness_df['n_tokens_somecot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_explanation_correctness_df['n_tokens_fullcot_response_group'] = pd.cut(all_explanation_correctness_df['n_tokens_fullcot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_explanation_correctness_df['n_tokens_description_group'] = pd.cut(all_explanation_correctness_df['n_tokens_description'], bins=[0, 100, 200, 300, 400, np.inf], labels=['0-100', '101-200', '201-300', '301-400', '401+'])
+
+all_unfaithful_restoration_errors_df['n_tokens_nocot_response'] = all_unfaithful_restoration_errors_df['nocot_response'].apply(lambda x: get_context_length(x))
+all_unfaithful_restoration_errors_df['n_tokens_somecot_response'] = all_unfaithful_restoration_errors_df['somecot_response'].apply(lambda x: get_context_length(x))
+all_unfaithful_restoration_errors_df['n_tokens_fullcot_response'] = all_unfaithful_restoration_errors_df['fullcot_response'].apply(lambda x: get_context_length(x))
+all_unfaithful_restoration_errors_df['n_tokens_description'] = all_unfaithful_restoration_errors_df['description'].apply(lambda x: get_context_length(x))
+
+all_unfaithful_restoration_errors_df['n_tokens_nocot_response_group'] = pd.cut(all_unfaithful_restoration_errors_df['n_tokens_nocot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_unfaithful_restoration_errors_df['n_tokens_somecot_response_group'] = pd.cut(all_unfaithful_restoration_errors_df['n_tokens_somecot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_unfaithful_restoration_errors_df['n_tokens_fullcot_response_group'] = pd.cut(all_unfaithful_restoration_errors_df['n_tokens_fullcot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
+all_unfaithful_restoration_errors_df['n_tokens_description_group'] = pd.cut(all_unfaithful_restoration_errors_df['n_tokens_description'], bins=[0, 100, 200, 300, 400, np.inf], labels=['0-100', '101-200', '201-300', '301-400', '401+'])
+
+print('\n-----------------------------------------------\n')
+print('All explanation correctness DataFrame after adding token counts and groups:\n')
+print(all_explanation_correctness_df.head())
+
+print('\n-----------------------------------------------\n')
+print('All unfaithful shortcut and restoration error DataFrame after adding token counts and groups:\n')
+print(all_unfaithful_restoration_errors_df.head())
+
+explanation_correctness_error_by_trial = all_explanation_correctness_df.groupby(['model', 'trial'])[['nocot_explanationcorrectness_error', 'somecot_explanationcorrectness_error', 'fullcot_explanationcorrectness_error']].sum().reset_index()
+unfaithful_shortcut_error_by_trial = all_unfaithful_restoration_errors_df.groupby(['model', 'trial'])[['nocot_unfaithfulshortcut_error', 'somecot_unfaithfulshortcut_error', 'fullcot_unfaithfulshortcut_error']].sum().reset_index()
+restoration_error_by_trial = all_unfaithful_restoration_errors_df.groupby(['model', 'trial'])[['nocot_restoration_error', 'somecot_restoration_error', 'fullcot_restoration_error']].sum().reset_index()
+
+print('\n\nExplanation Correctness Errors by Trial DataFrame:')
+print(explanation_correctness_error_by_trial)
+print('\n\nUnfaithful Shortcut Errors by Trial DataFrame:')
+print(unfaithful_shortcut_error_by_trial)
+print('\n\nRestoration Errors by Trial DataFrame:')
+print(restoration_error_by_trial)
+
+natural_plot(explanation_correctness_error_by_trial, unfaithful_shortcut_error_by_trial, restoration_error_by_trial, RESULTS_FILEPATH + 'natural_analysis_panel', error_titles=['Explanation Correctness Errors', 'Unfaithful Shortcut Errors', 'Restoration Errors'], show_plots=True)
+
+## Simulated Analysis ##
+all_simulated_errors_df = pd.DataFrame()  # Initialize empty DataFrame to store all simulated errors across models
+
+cols_to_keep = ['trial',
+                'description',
+                'outcome',
+                'hint_gt_outcome',
+
+                'nocot_parsed_response',
+                'somecot_parsed_response',
+                'fullcot_parsed_response',
+
+                'nocot_noexamples_hint_parsed_response',
+                'somecot_noexamples_hint_parsed_response',
+                'fullcot_noexamples_hint_parsed_response',
+
+                'nocot_randomfewshot_nohint_parsed_response',
+                'somecot_randomfewshot_nohint_parsed_response',
+                'fullcot_randomfewshot_nohint_parsed_response',
+                
+                'nocot_randomfewshot_hint_parsed_response',
+                'somecot_randomfewshot_hint_parsed_response',
+                'fullcot_randomfewshot_hint_parsed_response',
+                
+                'nocot_specificfewshot_nohint_parsed_response',
+                'somecot_specificfewshot_nohint_parsed_response',
+                'fullcot_specificfewshot_nohint_parsed_response',
+                
+                'nocot_specificfewshot_hint_parsed_response',
+                'somecot_specificfewshot_hint_parsed_response',
+                'fullcot_specificfewshot_hint_parsed_response']
+
+for m in MODELS:
+    simulated_filename = f'simulated_results_{m}.xlsx'
+    simulated_filepath = RESULTS_FILEPATH + simulated_filename
+    print(f'Checking for file: {simulated_filepath}')
+    if os.path.exists(simulated_filepath):
+        simulated_df = pd.read_excel(simulated_filepath)
+        print(f'\nLoaded file: {simulated_filepath} with shape {simulated_df.shape}')
+        print(f'Columns in the file: {simulated_df.columns.tolist()}')
+        print(simulated_df.head())
+        simulated_df = simulated_df.rename(columns={'no_cot_parsed_response': 'nocot_parsed_response',
+                                                    'some_cot_parsed_response': 'somecot_parsed_response',
+                                                    'full_cot_parsed_response': 'fullcot_parsed_response'})
+        simulated_df['model'] = m
+        all_simulated_errors_df = pd.concat([all_simulated_errors_df, simulated_df[cols_to_keep + ['model']]], ignore_index=True)
+    else:
+        print(f'Simulated iscorrect file not found for model {m}. Skipping simulated analysis for this model.')
+        continue
+
+print('\n\nAll simulated errors DataFrame after loading all models:')
+print('Shape:', all_simulated_errors_df.shape)
+print('Unique models in the DataFrame:', all_simulated_errors_df['model'].unique())
+print(f'Columns in all_simulated_errors_df: {all_simulated_errors_df.columns.tolist()}')
+print(all_simulated_errors_df.head())
+
+all_iscorrect_df, iscorrect_colnames, outcome_colnames = get_simulated_iscorrect(all_simulated_errors_df)
+print('\n\nAll iscorrect DataFrame after calculating iscorrect columns:')
+print('Shape:', all_iscorrect_df.shape)
+print(f'Columns in all_iscorrect_df: {all_iscorrect_df.columns.tolist()}')
+print(all_iscorrect_df.head())
+
+average_iscorrect_df = all_iscorrect_df.groupby('model')[iscorrect_colnames].mean().reset_index()
+balanced_iscorrect_df = all_iscorrect_df.groupby('model').apply(lambda x: pd.Series({col: balanced_accuracy_score(x[outcome_colnames[0]], x[col]) for col in iscorrect_colnames})).reset_index()
+stddev_iscorrect_df = all_iscorrect_df.groupby('model')[iscorrect_colnames].std().reset_index()
+
+print('\n\nAverage iscorrect values by model and description:')
+print(average_iscorrect_df.head())
+print('\n\nAverage balanced accuracy of iscorrect values by model and description:')
+print(balanced_iscorrect_df.head())
+print('\n\nStandard deviation of iscorrect values by model and description:')
+print(stddev_iscorrect_df.head())
+
+average_iscorrect_df.to_excel(RESULTS_FILEPATH + 'average_iscorrect_values.xlsx', index=False)
+stddev_iscorrect_df.to_excel(RESULTS_FILEPATH + 'stddev_iscorrect_values.xlsx', index=False)
+
+simulated_plot(average_iscorrect_df, RESULTS_FILEPATH + 'simulated_analysis_panel', show_plots=True)
+
+
+
+
+
+
+
+
+
+
+## Supplemental Analysis ##
+def check_discrete_distribution_equality(df, col1, col2):
+    """
+    Check if two discrete distributions are the same using Chi-Square test of independence.
+    """
+    # Get all unique values across both columns
+    all_values = np.union1d(df[col1].unique(), df[col2].unique())
+    # Get value counts for each column, reindexed to include all possible values
+    counts1 = df[col1].value_counts().reindex(all_values, fill_value=0).values
+    counts2 = df[col2].value_counts().reindex(all_values, fill_value=0).values
+
+    # Stack as a contingency table (2 rows: col1, col2)
+    observed = np.array([counts1, counts2])
+    print(f"Observed counts:\n{observed}")
+
+    # Chi-square test of independence
+    chi2_stat, p_value, _, _ = chi2_contingency(observed)
+
+    print(f"Chi-Square Statistic: {chi2_stat}, p-value: {p_value}")
+    if p_value < 0.05:
+        print("The two distributions are significantly different.")
+    else:
+        print("The two distributions are not significantly different.")
+
+    return chi2_stat, p_value
+
+def get_converted_unfaithfulrestoration_response_tokens(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type','total_responses', 'n_response_tokens','sum_restoration_errors'])
+
+    bins = ['0-500', '501-1000', '1001-1500', '1501+']
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} responses for unfaithful shortcut and restoration error response token analysis.')
+        for bin in bins:
+            row1 = {'model': model, 'cot_type': 'nocot', 'total_responses': temp_df[temp_df['n_tokens_nocot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': temp_df[temp_df['n_tokens_nocot_response_group'] == bin]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_nocot_response_group'] == bin]['nocot_unfaithfulshortcut_error'].sum()}
+            row2 = {'model': model, 'cot_type': 'somecot', 'total_responses': temp_df[temp_df['n_tokens_somecot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': temp_df[temp_df['n_tokens_somecot_response_group'] == bin]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_somecot_response_group'] == bin]['somecot_unfaithfulshortcut_error'].sum()}
+            row3 = {'model': model, 'cot_type': 'fullcot', 'total_responses': temp_df[temp_df['n_tokens_fullcot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': temp_df[temp_df['n_tokens_fullcot_response_group'] == bin]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_fullcot_response_group'] == bin]['fullcot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row1, row2, row3])], ignore_index=True)
+
+    return_df['total_responses'] = return_df['total_responses'].astype(int)
+    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
+    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
+    return_df['n_response_tokens'] = return_df['n_response_tokens'].astype(str)
+    return_df['cot_type'] = return_df['cot_type'].astype(str)
+
+    return return_df
+
+def get_converted_explanationcorrectness_response_tokens(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type','total_responses', 'n_response_tokens','sum_explanation_correctness_errors'])
+
+    bins = ['0-500', '501-1000', '1001-1500', '1501+']
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} responses for explanation correctness response token analysis.')
+        for bin in bins:
+            row1 = {'model': model, 'cot_type': 'nocot', 'total_responses': temp_df[temp_df['n_tokens_nocot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_nocot_response_group'] == bin]['nocot_explanationcorrectness_error'].sum()}
+            row2 = {'model': model, 'cot_type': 'somecot', 'total_responses': temp_df[temp_df['n_tokens_somecot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_somecot_response_group'] == bin]['somecot_explanationcorrectness_error'].sum()}
+            row3 = {'model': model, 'cot_type': 'fullcot', 'total_responses': temp_df[temp_df['n_tokens_fullcot_response_group'] == bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_fullcot_response_group'] == bin]['fullcot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row1, row2, row3])], ignore_index=True)
+
+    return_df['total_responses'] = return_df['total_responses'].astype(int)
+    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
+    return_df['n_response_tokens'] = return_df['n_response_tokens'].astype(str)
+    return_df['cot_type'] = return_df['cot_type'].astype(str)
+
+    return return_df
+
+def get_converted_unfaithfulrestoration_description_tokens(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type','n_description_tokens','total_descriptions', 'sum_restoration_errors', 'sum_unfaithfulshortcut_errors'])
+
+    bins = ['0-100', '101-200', '201-300', '301-400', '401+']
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} descriptions for unfaithful/restoration error analysis.')
+        for bin in bins:
+            row = {'model': model, 'cot_type': 'nocot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['nocot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+            row = {'model': model, 'cot_type': 'somecot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['somecot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+            row = {'model': model, 'cot_type': 'fullcot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['fullcot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
+    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
+    return return_df
+
+def get_converted_explanationcorrectness_description_tokens(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type','n_description_tokens','total_descriptions', 'sum_explanation_correctness_errors'])
+
+    bins = ['0-100', '101-200', '201-300', '301-400', '401+']
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} descriptions for explanation correctness analysis.')
+        for bin in bins:
+            row = {'model': model, 'cot_type': 'nocot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['nocot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+            row = {'model': model, 'cot_type': 'somecot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['somecot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+            row = {'model': model, 'cot_type': 'fullcot', 'n_description_tokens': bin, 'total_descriptions': temp_df[temp_df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': temp_df[temp_df['n_tokens_description_group'] == bin]['fullcot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
+    return return_df
+
+def get_converted_unfaithfulrestoration_outcome(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type', 'cot_outcome', 'total_outcomes', 'sum_restoration_errors', 'sum_unfaithfulshortcut_errors'])
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} descriptions for unfaithful/restoration error analysis.')
+
+        outcomes_nocot = temp_df['nocot_outcome'].unique()
+        outcomes_somecot = temp_df['somecot_outcome'].unique()
+        outcomes_fullcot = temp_df['fullcot_outcome'].unique()
+
+        for outcome in outcomes_nocot:
+            row = {'model': model, 'cot_type': 'nocot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0],'sum_restoration_errors': temp_df[temp_df['outcome'] == outcome]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['outcome'] == outcome]['nocot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+        for outcome in outcomes_somecot:
+            row = {'model': model, 'cot_type': 'somecot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0], 'sum_restoration_errors': temp_df[temp_df['outcome'] == outcome]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['outcome'] == outcome]['somecot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+        for outcome in outcomes_fullcot:
+            row = {'model': model, 'cot_type': 'fullcot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0], 'sum_restoration_errors': temp_df[temp_df['outcome'] == outcome]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': temp_df[temp_df['outcome'] == outcome]['fullcot_unfaithfulshortcut_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
+    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
+
+    return_df['cot_outcome'] = return_df['cot_outcome'].astype(int)
+    return_df['cot_outcome'] = return_df['cot_outcome'].map(reverse_replace_dict)
+
+    return return_df
+
+def get_converted_explanationcorrectness_outcome(df, model_list):
+    return_df = pd.DataFrame(columns=['cot_type', 'cot_outcome', 'total_outcomes', 'sum_explanation_correctness_errors'])
+
+    print(df.columns)
+
+    for model in model_list:
+        temp_df = df[df['model'] == model].copy()
+        print(f'\nProcessing model: {model} with {temp_df.shape[0]} descriptions for explanation correctness error analysis.')
+
+        outcomes =  [-1, 0, 1, 2, 3, 4, 5, 6]
+
+        for outcome in outcomes:
+            row = {'model': model, 'cot_type': 'nocot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0],'sum_explanation_correctness_errors': temp_df[temp_df['outcome'] == outcome]['nocot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+        
+        for outcome in outcomes:
+            row = {'model': model, 'cot_type': 'somecot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0], 'sum_explanation_correctness_errors': temp_df[temp_df['outcome'] == outcome]['somecot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+        for outcome in outcomes:
+            row = {'model': model, 'cot_type': 'fullcot', 'cot_outcome': outcome, 'total_outcomes': temp_df[temp_df['outcome'] == outcome].shape[0], 'sum_explanation_correctness_errors': temp_df[temp_df['outcome'] == outcome]['fullcot_explanationcorrectness_error'].sum()}
+            return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
+
+    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
+
+    return_df['cot_outcome'] = return_df['cot_outcome'].astype(int)
+    return_df['cot_outcome'] = return_df['cot_outcome'].map(reverse_replace_dict)
+
+    return return_df
+
+def natural_explanationcorrectness_response_bins_plot(df, filepath, show_plots=True):
+    model_names_to_display = {
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
@@ -84,15 +1145,9 @@ def natural_explanationcorrectness_response_bins_plot(df, filepath):
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        # Remove nocot for Mistral and Phi, keep for DeepSeek
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -168,7 +1223,7 @@ def natural_explanationcorrectness_response_bins_plot(df, filepath):
             )
 
         # Set y-axis to start at 0 and end at 120
-        ax.set_ylim(0, 120)
+        ax.set_ylim(0, 600)
 
         # Adjust tick params for clarity
         ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
@@ -197,11 +1252,11 @@ def natural_explanationcorrectness_response_bins_plot(df, filepath):
     if show_plots:
         plt.show()
 
-def natural_response_bins_plot(df, filepath):
+def natural_response_bins_plot(df, filepath, show_plots=True):
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
@@ -218,15 +1273,9 @@ def natural_response_bins_plot(df, filepath):
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        # Remove nocot for Mistral and Phi, keep for DeepSeek
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -309,8 +1358,8 @@ def natural_response_bins_plot(df, filepath):
                 ha='center', va='top', fontsize=16, color='#3a414a', transform=ax.get_xaxis_transform(), clip_on=False
             )
 
-        # Set y-axis to start at 0 and end at 200
-        ax.set_ylim(0, 200)
+        # Set y-axis to start at 0 and end at 800
+        ax.set_ylim(0, 1200)
 
         # Adjust tick params for clarity
         ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
@@ -341,9 +1390,9 @@ def natural_response_bins_plot(df, filepath):
 
 def natural_explanationcorrectness_desc_bins_plot(df, filepath, show_plots=True):
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
@@ -360,15 +1409,9 @@ def natural_explanationcorrectness_desc_bins_plot(df, filepath, show_plots=True)
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        # Remove nocot for Mistral and Phi, keep for DeepSeek
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -432,7 +1475,7 @@ def natural_explanationcorrectness_desc_bins_plot(df, filepath, show_plots=True)
                 ha='center', va='top', fontsize=16, color='#3a414a', transform=ax.get_xaxis_transform()
             )
 
-        ax.set_ylim(0, max(total_heights) * 1.1 if len(total_heights) > 0 else 1)
+        ax.set_ylim(0, max(total_heights) * 1.35 if len(total_heights) > 0 else 1)
 
         ax.set_axisbelow(True)
         ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
@@ -466,9 +1509,9 @@ def natural_explanationcorrectness_desc_bins_plot(df, filepath, show_plots=True)
 
 def natural_desc_bins_plot(df, filepath, show_plots=True):
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
@@ -485,15 +1528,9 @@ def natural_desc_bins_plot(df, filepath, show_plots=True):
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        # Remove nocot for Mistral and Phi, keep for DeepSeek
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -561,7 +1598,7 @@ def natural_desc_bins_plot(df, filepath, show_plots=True):
                 ha='center', va='top', fontsize=16, color='#3a414a', transform=ax.get_xaxis_transform()
             )
 
-        ax.set_ylim(0, 50 + (max(total_heights) if len(total_heights) > 0 else 1))
+        ax.set_ylim(0, 350 + (max(total_heights) if len(total_heights) > 0 else 1))
 
         ax.set_axisbelow(True)
         ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
@@ -595,15 +1632,15 @@ def natural_desc_bins_plot(df, filepath, show_plots=True):
 
 def natural_explanationcorrectness_outcome_plot(df, filepath, show_plots=True):
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
     cot_type_labels = ['No CoT', 'Some CoT', 'Full CoT']
     models = df['model'].unique()
-    outcome_labels = sorted(df['cot_outcome'].unique(), key=lambda x: str(x))
+    outcome_labels = ['NONE', 'IMV ONLY', 'NIPPV ONLY', 'HFNI ONLY', 'NIPPV TO IMV', 'HFNI TO IMV', 'IMV TO NIPPV', 'IMV TO HFNI']
     bar_width = 0.45
     n_outcomes = len(outcome_labels)
     n_cot = len(cot_types)
@@ -615,14 +1652,9 @@ def natural_explanationcorrectness_outcome_plot(df, filepath, show_plots=True):
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -689,7 +1721,7 @@ def natural_explanationcorrectness_outcome_plot(df, filepath, show_plots=True):
         # Add model label above each subplot
         ax.set_title(model_names_to_display.get(model, model), fontsize=16, color='#3a414a')
 
-        ax.set_ylim(0, 70)
+        ax.set_ylim(0, 90)
         ax.set_axisbelow(True)
         ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
         ax.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
@@ -717,15 +1749,15 @@ def natural_explanationcorrectness_outcome_plot(df, filepath, show_plots=True):
 
 def natural_outcome_plot(df, filepath, show_plots=True):
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
     cot_type_labels = ['No CoT', 'Some CoT', 'Full CoT']
     models = df['model'].unique()
-    outcome_labels = sorted(df['cot_outcome'].unique(), key=lambda x: str(x))
+    outcome_labels = ['NONE', 'IMV ONLY', 'NIPPV ONLY', 'HFNI ONLY', 'NIPPV TO IMV']
     bar_width = 0.45
     n_outcomes = len(outcome_labels)
     n_cot = len(cot_types)
@@ -737,15 +1769,9 @@ def natural_outcome_plot(df, filepath, show_plots=True):
         ax = axes[i]
         df_model = df[df['model'] == model]
 
-        # Remove nocot for Mistral and Phi, keep for DeepSeek
-        if model_names_to_display.get(model, model) in ['Mistral', 'Phi']:
-            cot_types_plot = ['somecot', 'fullcot']
-            cot_type_labels_plot = ['Some CoT', 'Full CoT']
-            n_cot_plot = 2
-        else:
-            cot_types_plot = cot_types
-            cot_type_labels_plot = cot_type_labels
-            n_cot_plot = 3
+        cot_types_plot = cot_types
+        cot_type_labels_plot = cot_type_labels
+        n_cot_plot = 3
 
         x_pos = []
         total_heights = []
@@ -820,7 +1846,7 @@ def natural_outcome_plot(df, filepath, show_plots=True):
             )
 
         # Set y-axis to start at 0 and end at 50 + max(total_heights)
-        ax.set_ylim(0, 50 + (max(total_heights) if len(total_heights) > 0 else 1))
+        ax.set_ylim(0, 350 + (max(total_heights) if len(total_heights) > 0 else 1))
 
         # Add gridlines (major: dark grey, minor: light grey)
         ax.set_axisbelow(True)
@@ -854,297 +1880,6 @@ def natural_outcome_plot(df, filepath, show_plots=True):
     if show_plots:
         plt.show()
 
-def natural_plot(sum_DeepSeek_nocot, sum_mistral_nocot, sum_phi_nocot,
-                  sum_DeepSeek_somecot, sum_mistral_somecot, sum_phi_somecot,
-                  sum_DeepSeek_fullcot, sum_mistral_fullcot, sum_phi_fullcot,
-                  type_of_error, filename):
-    models = ['DeepSeek', 'Mistral', 'Phi']
-    cot_types = ['Some CoT', 'Full CoT']  # Removed 'No CoT'
-
-    # Only keep Some CoT and Full CoT values (skip No CoT)
-    DeepSeek_vals = [
-        sum_DeepSeek_somecot,
-        sum_DeepSeek_fullcot
-    ]
-    mistral_vals = [
-        sum_mistral_somecot,
-        sum_mistral_fullcot
-    ]
-    phi_vals = [
-        sum_phi_somecot,
-        sum_phi_fullcot
-    ]
-
-    print(f"DeepSeek NOCOT: {sum_DeepSeek_nocot}")
-
-    cot_sums = {
-        'DeepSeek': DeepSeek_vals,
-        'Mistral': mistral_vals,
-        'Phi': phi_vals
-    }
-
-    colors = {
-        'DeepSeek': '#ac2e44',
-        'Mistral': '#0e343e',
-        'Phi': '#72ccae'
-    }
-
-    x = np.arange(len(cot_types))
-    width = 0.25
-
-    _, ax = plt.subplots(layout='constrained')
-
-    hatch_types = ['///', None, '\\\\\\']
-    for i, model in enumerate(models):
-        offset = (i - 1) * width
-        rects = ax.bar(
-            x + offset, cot_sums[model], width, label=model,
-            color=colors[model], hatch=hatch_types[i], edgecolor='#3a414a'
-        )
-        ax.bar_label(rects, padding=3, fontsize=16)
-
-    ax.set_axisbelow(True)
-    ax.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2)
-    ax.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7)
-    ax.xaxis.grid(False)
-    ax.minorticks_on()
-
-    custom_color = '#3a414a'
-    ax.set_ylabel('Error Sum', color=custom_color, fontsize=16)
-    ax.set_title(f'{type_of_error}', color=custom_color, fontsize=16)
-    ax.set_xticks(x)
-    ax.set_xticklabels(cot_types, color=custom_color, fontsize=16)
-    plt.setp(ax.get_yticklabels(), color=custom_color, fontsize=16)
-    ax.legend(fontsize=13.5, title_fontsize=13.5)
-    ax.set_ylim(0, 40)
-    ax.set_yticks(np.arange(0, 41, 5))
-
-    plt.savefig(f"{filename}.png", dpi=600)
-    plt.savefig(f"{filename}.svg")
-    if show_plots:
-        plt.show()
-
-def draw_vertical_pathway(ax, x, y_vals, color='#b0b0b0', alpha=0.25, text_color='#3a414a', diff_bold_color='#ac2e44'):
-    y_vals_sorted = sorted(y_vals, key=lambda tup: tup[1], reverse=True)
-    if len(y_vals_sorted) >= 2:
-        y_poly = [y for _, y, *_ in y_vals_sorted]
-        ax.fill_betweenx(y_poly, x-0.13, x+0.13, color=color, alpha=alpha, zorder=1)
-        for i in range(len(y_vals_sorted)-1):
-            y0 = y_vals_sorted[i][1]
-            y1 = y_vals_sorted[i+1][1]
-            # Removed the vertical line: ax.plot([x, x], [y0, y1], color=color, alpha=0.7, zorder=2)
-            diff = y0 - y1
-            ym = (y0 + y1) / 2
-    for label, y, c, m, z in y_vals_sorted:
-        ax.scatter(x, y, label=label, color=c, marker=m, s=120, zorder=z)
-
-def simulated_plot(df, model_size_dict, filepath, show_plots=True):
-    custom_color = '#3a414a'
-    diff_bold_color = '#ac2e44'
-
-    model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
-    }
-
-    cot_type_order = ['nocot', 'somecot', 'fullcot']
-    cot_type_labels = ['No CoT', 'Some CoT', 'Full CoT']
-    cot_type_map = {k: i for i, k in enumerate(cot_type_order)}
-
-    models = df['model'].unique()
-    fig, axes = plt.subplots(len(models), 3, figsize=(18, 5 * len(models)), sharex='col', constrained_layout=True)
-    if len(models) == 1:
-        axes = [axes]
-
-    # Legend handles
-    legend_elements_random = [
-        plt.Line2D([0], [0], marker='h', color='w', label='RandomFewShot + Hint', markerfacecolor='#ac2e44', markersize=14),
-        plt.Line2D([0], [0], marker='p', color='w', label='RandomFewShot + NoHint', markerfacecolor='#0e343e', markersize=14),
-        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=14)
-    ]
-    legend_elements_specific = [
-        plt.Line2D([0], [0], marker='h', color='w', label='SpecificFewShot + Hint', markerfacecolor='#ac2e44', markersize=14),
-        plt.Line2D([0], [0], marker='p', color='w', label='SpecificFewShot + NoHint', markerfacecolor='#0e343e', markersize=14),
-        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=14)
-    ]
-    legend_elements_panel3 = [
-        plt.Line2D([0], [0], marker='h', color='w', label='Hint Only', markerfacecolor='#ac2e44', markersize=14),
-        plt.Line2D([0], [0], marker='8', color='w', label='Unbiased', markerfacecolor='#72ccae', markersize=14)
-    ]
-
-    # --- 1. Gather all y-values for all panels ---
-    all_yvals = []
-    for idx, model in enumerate(models):
-        df_model = df[df['model'] == model]
-        model_response_size = model_size_dict.get(model, 1000)
-        rf_hint = df_model[(df_model['example_type'] == 'randomfewshot') & (df_model['hint_type'] == 'hint')]
-        rf_nohint = df_model[(df_model['example_type'] == 'randomfewshot') & (df_model['hint_type'] == 'nohint')]
-        unbiased = df_model.drop_duplicates(subset=['cot_type'])
-        sf_hint = df_model[(df_model['example_type'] == 'specificfewshot') & (df_model['hint_type'] == 'hint')]
-        sf_nohint = df_model[(df_model['example_type'] == 'specificfewshot') & (df_model['hint_type'] == 'nohint')]
-        hint_only = df_model[(df_model['example_type'] == 'noexamples') & (df_model['hint_type'] == 'hint')]
-
-        for cot in cot_type_order:
-            for v in [
-                rf_hint[rf_hint['cot_type'] == cot]['sum_iscorrect'] / model_response_size,
-                rf_nohint[rf_nohint['cot_type'] == cot]['sum_iscorrect'] / model_response_size,
-                unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size,
-                sf_hint[sf_hint['cot_type'] == cot]['sum_iscorrect'] / model_response_size,
-                sf_nohint[sf_nohint['cot_type'] == cot]['sum_iscorrect'] / model_response_size,
-                unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size,
-                unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size,
-                hint_only[hint_only['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            ]:
-                if not v.empty:
-                    all_yvals.append(v.values[0])
-
-    # --- 2. Compute global min and max ---
-    if all_yvals:
-        global_min = min(all_yvals)
-        global_max = max(all_yvals)
-    else:
-        global_min, global_max = 0, 1
-
-    # --- 3. Plot as before, with gridlines, y-limits, and legends in first row ---
-    for idx, model in enumerate(models):
-        df_model = df[df['model'] == model]
-        model_response_size = model_size_dict.get(model, 1000)
-
-        # PANEL 1: RANDOM FEW SHOT
-        ax1 = axes[idx][0] if len(models) > 1 else axes[0]
-        rf_hint = df_model[(df_model['example_type'] == 'randomfewshot') & (df_model['hint_type'] == 'hint')]
-        rf_nohint = df_model[(df_model['example_type'] == 'randomfewshot') & (df_model['hint_type'] == 'nohint')]
-        unbiased = df_model.drop_duplicates(subset=['cot_type'])
-
-        ax1.set_axisbelow(True)
-        ax1.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
-        ax1.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
-        ax1.xaxis.grid(False)
-        ax1.minorticks_on()
-
-        for cot in cot_type_order:
-            x = cot_type_map[cot]
-            yvals = []
-            v = rf_hint[rf_hint['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            if not v.empty:
-                yvals.append(('RandomFewShot + Hint', v.values[0], '#ac2e44', 'h', 4))
-            v = rf_nohint[rf_nohint['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            if not v.empty:
-                yvals.append(('RandomFewShot + NoHint', v.values[0], '#0e343e', 'p', 4))
-            v = unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size
-            if not v.empty:
-                yvals.append(('Unbiased', v.values[0], '#72ccae', '8', 5))
-            if yvals:
-                draw_vertical_pathway(ax1, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
-        ax1.set_ylabel('Accuracy', color=custom_color, fontsize=16)
-        ax1.tick_params(axis='x', colors=custom_color, labelsize=16)
-        ax1.tick_params(axis='y', colors=custom_color, labelsize=16)
-        ax1.set_xticks([cot_type_map[c] for c in cot_type_order])
-        ax1.set_xticklabels(cot_type_labels, color=custom_color, fontsize=16)
-        plt.setp(ax1.get_yticklabels(), color=custom_color, fontsize=16)
-        for spine in ax1.spines.values():
-            spine.set_color(custom_color)
-        ax1.set_ylim(global_min, global_max)
-        if idx == 0:
-            ax1.legend(handles=legend_elements_random, loc='upper center', fontsize=11.5)
-
-        # PANEL 2: SPECIFIC FEW SHOT
-        ax2 = axes[idx][1] if len(models) > 1 else axes[1]
-        sf_hint = df_model[(df_model['example_type'] == 'specificfewshot') & (df_model['hint_type'] == 'hint')]
-        sf_nohint = df_model[(df_model['example_type'] == 'specificfewshot') & (df_model['hint_type'] == 'nohint')]
-
-        ax2.set_axisbelow(True)
-        ax2.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
-        ax2.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
-        ax2.xaxis.grid(False)
-        ax2.minorticks_on()
-
-        for cot in cot_type_order:
-            x = cot_type_map[cot]
-            yvals = []
-            v = sf_hint[sf_hint['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            if not v.empty:
-                yvals.append(('SpecificFewShot + Hint', v.values[0], '#ac2e44', 'h', 4))
-            v = sf_nohint[sf_nohint['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            if not v.empty:
-                yvals.append(('SpecificFewShot + NoHint', v.values[0], '#0e343e', 'p', 4))
-            v = unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size
-            if not v.empty:
-                yvals.append(('Unbiased', v.values[0], '#72ccae', '8', 5))
-            if yvals:
-                draw_vertical_pathway(ax2, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
-        ax2.tick_params(axis='x', colors=custom_color, labelsize=16)
-        ax2.tick_params(axis='y', colors=custom_color, labelsize=16)
-        ax2.set_xticks([cot_type_map[c] for c in cot_type_order])
-        ax2.set_xticklabels(cot_type_labels, color=custom_color, fontsize=16)
-        plt.setp(ax2.get_yticklabels(), color=custom_color, fontsize=16)
-        for spine in ax2.spines.values():
-            spine.set_color(custom_color)
-        ax2.set_ylim(global_min, global_max)
-        if idx == 0:
-            ax2.legend(handles=legend_elements_specific, loc='upper left', fontsize=11.5)
-
-        # PANEL 3: UNBIASED VS HINT-ONLY (no examples)
-        ax3 = axes[idx][2] if len(models) > 1 else axes[2]
-        hint_only = df_model[(df_model['example_type'] == 'noexamples') & (df_model['hint_type'] == 'hint')]
-
-        ax3.set_axisbelow(True)
-        ax3.yaxis.grid(True, which='major', color='#b0b0b0', linewidth=1.2, alpha=0.6)
-        ax3.yaxis.grid(True, which='minor', color='#e0e0e0', linewidth=0.7, alpha=0.4)
-        ax3.xaxis.grid(False)
-        ax3.minorticks_on()
-
-        for cot in cot_type_order:
-            x = cot_type_map[cot]
-            yvals = []
-            v = unbiased[unbiased['cot_type'] == cot]['sum_iscorrect_unbiased'] / model_response_size
-            if not v.empty:
-                yvals.append(('Unbiased', v.values[0], '#72ccae', '8', 5))
-            v = hint_only[hint_only['cot_type'] == cot]['sum_iscorrect'] / model_response_size
-            if not v.empty:
-                yvals.append(('Hint Only', v.values[0], '#ac2e44', 'h', 4))
-            if yvals:
-                draw_vertical_pathway(ax3, x, yvals, color='#b0b0b0', alpha=0.25, text_color=custom_color, diff_bold_color=diff_bold_color)
-        ax3.tick_params(axis='x', colors=custom_color, labelsize=16)
-        ax3.tick_params(axis='y', colors=custom_color, labelsize=16)
-        ax3.set_xticks([cot_type_map[c] for c in cot_type_order])
-        ax3.set_xticklabels(cot_type_labels, color=custom_color, fontsize=16)
-        plt.setp(ax3.get_yticklabels(), color=custom_color, fontsize=16)
-        for spine in ax3.spines.values():
-            spine.set_color(custom_color)
-        ax3.set_ylim(global_min, global_max)
-        if idx == 0:
-            ax3.legend(handles=legend_elements_panel3, loc='upper left', fontsize=11.5)
-
-        # Model label
-        ax_for_label = ax3
-        ylim = ax_for_label.get_ylim()
-        ymid = (ylim[0] + ylim[1]) / 2
-        ax_for_label.text(
-            1.04, ymid, model_names_to_display.get(model, ''),
-            color=custom_color, fontsize=16,
-            va='center', ha='left', rotation=270,
-            transform=ax_for_label.get_yaxis_transform()
-        )
-
-    # Remove all x-axis labels for all axes
-    for row in axes:
-        for ax in row:
-            ax.set_xlabel('')
-
-    # Tight layout first to pack everything
-    plt.tight_layout()
-    # Make room for the label below the axes
-    plt.subplots_adjust(bottom=0.075)  # Increase if needed
-
-    # Place the label below all subplots and their axis labels
-    fig.text(0.5, 0.03, 'CoT Type', ha='center', va='center', fontsize=16, color=custom_color)
-
-    plt.savefig(filepath + "simulated_errors_plot.png", dpi=300)
-    plt.savefig(filepath + "simulated_errors_plot.svg")
-    if show_plots:
-        plt.show()
 
 def plot_panel_discrete_distribution_overlay(simulated_df_dict, models, cot_types, hint_only_responses, savepath=None, show_plots=True):
     """
@@ -1162,9 +1897,9 @@ def plot_panel_discrete_distribution_overlay(simulated_df_dict, models, cot_type
     color_hint = '#ac2e44'      # dark red
 
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
     cot_type_labels = ['No CoT', 'Some CoT', 'Full CoT']
 
@@ -1243,7 +1978,7 @@ def plot_panel_discrete_distribution_overlay(simulated_df_dict, models, cot_type
                     plt.Line2D([0], [0], color=color_hint, lw=8, label='Hint Only'),
                     plt.Line2D([0], [0], color=color_unbiased, lw=8, alpha=0.45, label='Shifted Unbiased')
                 ]
-                ax.legend(handles=handles, fontsize=12, loc='upper right', bbox_to_anchor=(1, 0.78))
+                ax.legend(handles=handles, fontsize=11, loc='upper right', bbox_to_anchor=(1, 0.78))
             else:
                 ax.set_title('')
 
@@ -1254,11 +1989,13 @@ def plot_panel_discrete_distribution_overlay(simulated_df_dict, models, cot_type
     if show_plots:
         plt.show()
 
+
 def percent_difference(new, baseline):
     """Return percent difference from baseline to new value."""
     if baseline == 0:
         return 0
     return ((new - baseline) / baseline) * 100
+
 
 def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=None, show_plots=True):
     """
@@ -1271,9 +2008,9 @@ def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=No
     import numpy as np
 
     model_names_to_display = {
-        'mistralsmall24binstruct2501q80': 'Mistral',
-        'deepseekr132b': 'DeepSeek',
-        'phi414bq80': 'Phi'
+        'mistralsmall24binstruct2501q4KM': 'Mistral',
+        'deepseekr132bqwendistillq4KM': 'DeepSeek',
+        'phi414bq4KM': 'Phi'
     }
 
     cot_types = ['nocot', 'somecot', 'fullcot']
@@ -1304,7 +2041,9 @@ def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=No
         percent_diffs = []
         for cot in cot_types:
             pd_random = percent_difference(random_counts[cot], unbiased_counts[cot])
+            print(f"Model: {m}, CoT: {cot}, Random Count: {random_counts[cot]}, Unbiased Count: {unbiased_counts[cot]}, Percent Difference: {pd_random:.2f}%"   )
             pd_specific = percent_difference(specific_counts[cot], unbiased_counts[cot])
+            print(f"Model: {m}, CoT: {cot}, Specific Count: {specific_counts[cot]}, Unbiased Count: {unbiased_counts[cot]}, Percent Difference: {pd_specific:.2f}%")
             percent_diffs.append([pd_random, pd_specific])
 
         percent_diffs = np.array(percent_diffs)  # shape (3,2)
@@ -1351,7 +2090,7 @@ def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=No
                         ha='center', va='top', fontsize=12)
 
         # Add baseline text between -50% and -100%
-        baseline_y = -75  # Fixed position at -75%
+        baseline_y = -125  # Fixed position at -75%
         for idx, cot in enumerate(cot_types):
             ax.text(
                 x[idx], baseline_y,
@@ -1359,10 +2098,8 @@ def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=No
                 ha='center', va='center', fontsize=14, color='#3a414a', fontweight='bold'
             )
         
-        # Set y-limits: -100% at bottom, add padding above max value
-        max_value = np.max(percent_diffs)
-        upper_limit = max_value + 20 if max_value > 0 else 20  # Add 20% padding above max
-        ax.set_ylim(-100, upper_limit)
+        # Set y-limits: -100% at bottom, add padding above max valu
+        ax.set_ylim(-150, 700)
 
     plt.tight_layout()
     if savepath:
@@ -1371,464 +2108,65 @@ def plot_examples_only_percent_difference(simulated_df_dict, models, savepath=No
     if show_plots:
         plt.show()
 
-def get_simulated_iscorrect(df):
-    df['gt_outcome'] = df['gt_outcome'].astype(int)
-
-    cot_types = ['nocot', 'somecot', 'fullcot']
-    example_types = ['randomfewshot', 'specificfewshot']
-    hint_types = ['nohint', 'hint']
-
-    iscorrect_colnames = []
-    for cot in cot_types:
-        for example in example_types:
-            for hint in hint_types:
-                df[f'{cot}_{example}_{hint}_parsed_response'] = df[f'{cot}_{example}_{hint}_parsed_response'].astype(int)
-                colname = f'iscorrect_{cot}_{example}_{hint}'
-                df[colname] = np.where(df[f'{cot}_{example}_{hint}_parsed_response'] == df['gt_outcome'], 1, 0)
-                iscorrect_colnames.append(colname)
-
-    additional_columns = [
-        'no_cot_parsed_response', 'some_cot_parsed_response', 'full_cot_parsed_response',
-        'nocot_noexamples_hint_parsed_response', 'somecot_noexamples_hint_parsed_response', 'fullcot_noexamples_hint_parsed_response'
-    ]
-    df[additional_columns] = df[additional_columns].astype(int)
-    for col in additional_columns:
-        colname = f'iscorrect_{col}'
-        iscorrect_colnames.append(colname)
-        df[colname] = np.where(df[col] == df['gt_outcome'], 1, 0)
-
-    return df, iscorrect_colnames
-
-def get_converted_simulated_iscorrect(df, model):
-    return_df = pd.DataFrame(columns=['cot_type','example_type', 'hint_type', 'sum_iscorrect'])
-
-    row1 = {'model': model, 'cot_type': 'nocot', 'example_type': 'randomfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_nocot_randomfewshot_nohint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_no_cot_parsed_response'].sum()}
-    row2 = {'model': model, 'cot_type': 'nocot', 'example_type': 'randomfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_nocot_randomfewshot_hint'].sum(),
-              'sum_iscorrect_unbiased': df['iscorrect_no_cot_parsed_response'].sum()}
-    row3 = {'model': model, 'cot_type': 'nocot', 'example_type': 'specificfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_nocot_specificfewshot_nohint'].sum(),
-              'sum_iscorrect_unbiased': df['iscorrect_no_cot_parsed_response'].sum()}
-    row4 = {'model': model, 'cot_type': 'nocot', 'example_type': 'specificfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_nocot_specificfewshot_hint'].sum(),
-              'sum_iscorrect_unbiased': df['iscorrect_no_cot_parsed_response'].sum()}
-    row5 = {'model': model, 'cot_type': 'somecot', 'example_type': 'randomfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_somecot_randomfewshot_nohint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_some_cot_parsed_response'].sum()}
-    row6 = {'model': model, 'cot_type': 'somecot', 'example_type': 'randomfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_somecot_randomfewshot_hint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_some_cot_parsed_response'].sum()}
-    row7 = {'model': model, 'cot_type': 'somecot', 'example_type': 'specificfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_somecot_specificfewshot_nohint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_some_cot_parsed_response'].sum()}
-    row8 = {'model': model, 'cot_type': 'somecot', 'example_type': 'specificfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_somecot_specificfewshot_hint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_some_cot_parsed_response'].sum()}
-    row9 = {'model': model, 'cot_type': 'fullcot', 'example_type': 'randomfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_fullcot_randomfewshot_nohint'].sum(),
-            'sum_iscorrect_unbiased': df['iscorrect_full_cot_parsed_response'].sum()}
-    row10 = {'model': model, 'cot_type': 'fullcot', 'example_type': 'randomfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_fullcot_randomfewshot_hint'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_full_cot_parsed_response'].sum()}
-    row11 = {'model': model, 'cot_type': 'fullcot', 'example_type': 'specificfewshot', 'hint_type': 'nohint', 'sum_iscorrect': df['iscorrect_fullcot_specificfewshot_nohint'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_full_cot_parsed_response'].sum()}
-    row12 = {'model': model, 'cot_type': 'fullcot', 'example_type': 'specificfewshot', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_fullcot_specificfewshot_hint'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_full_cot_parsed_response'].sum()}
-    row13 = {'model': model, 'cot_type': 'nocot', 'example_type': 'noexamples', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_nocot_noexamples_hint_parsed_response'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_no_cot_parsed_response'].sum()}
-    row14 = {'model': model, 'cot_type': 'somecot', 'example_type': 'noexamples', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_somecot_noexamples_hint_parsed_response'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_some_cot_parsed_response'].sum()}
-    row15 = {'model': model, 'cot_type': 'fullcot', 'example_type': 'noexamples', 'hint_type': 'hint', 'sum_iscorrect': df['iscorrect_fullcot_noexamples_hint_parsed_response'].sum(),
-             'sum_iscorrect_unbiased': df['iscorrect_full_cot_parsed_response'].sum()}
-    return_df = pd.concat([return_df, pd.DataFrame([row1, row2, row3, row4, row5, row6, row7, row8, row9, row10, row11, row12, row13, row14, row15])], ignore_index=True)
-    return_df['sum_iscorrect'] = return_df['sum_iscorrect'].astype(int)
-
-    return return_df
-
-def get_converted_natural_response_tokens(df, model):
-    return_df = pd.DataFrame(columns=['cot_type','total_responses', 'n_response_tokens','sum_restoration_errors'])
-
-    bins = ['0-500', '501-1000', '1001-1500', '1501+']
-
-    for bin in bins:
-        row1 = {'model': model, 'cot_type': 'nocot', 'total_responses': df[df['n_tokens_nocot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': df[df['n_tokens_nocot_response_group'] == bin]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_nocot_response_group'] == bin]['nocot_unfaithfulshortcut_error'].sum()}
-        row2 = {'model': model, 'cot_type': 'somecot', 'total_responses': df[df['n_tokens_somecot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': df[df['n_tokens_somecot_response_group'] == bin]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_somecot_response_group'] == bin]['somecot_unfaithfulshortcut_error'].sum()}
-        row3 = {'model': model, 'cot_type': 'fullcot', 'total_responses': df[df['n_tokens_fullcot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_restoration_errors': df[df['n_tokens_fullcot_response_group'] == bin]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_fullcot_response_group'] == bin]['fullcot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row1, row2, row3])], ignore_index=True)
-
-    return_df['total_responses'] = return_df['total_responses'].astype(int)
-    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
-    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
-    return_df['n_response_tokens'] = return_df['n_response_tokens'].astype(str)
-    return_df['cot_type'] = return_df['cot_type'].astype(str)
-
-    return return_df
-
-def get_converted_explanationcorrectness_response_tokens(df, model):
-    return_df = pd.DataFrame(columns=['cot_type','total_responses', 'n_response_tokens','sum_explanation_correctness_errors'])
-
-    bins = ['0-500', '501-1000', '1001-1500', '1501+']
-
-    for bin in bins:
-        row1 = {'model': model, 'cot_type': 'nocot', 'total_responses': df[df['n_tokens_nocot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': df[df['n_tokens_nocot_response_group'] == bin]['nocot_explanationcorrectness_error'].sum()}
-        row2 = {'model': model, 'cot_type': 'somecot', 'total_responses': df[df['n_tokens_somecot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': df[df['n_tokens_somecot_response_group'] == bin]['somecot_explanationcorrectness_error'].sum()}
-        row3 = {'model': model, 'cot_type': 'fullcot', 'total_responses': df[df['n_tokens_fullcot_response_group']==bin].shape[0], 'n_response_tokens': bin, 'sum_explanation_correctness_errors': df[df['n_tokens_fullcot_response_group'] == bin]['fullcot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row1, row2, row3])], ignore_index=True)
-
-    return_df['total_responses'] = return_df['total_responses'].astype(int)
-    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
-    return_df['n_response_tokens'] = return_df['n_response_tokens'].astype(str)
-    return_df['cot_type'] = return_df['cot_type'].astype(str)
-
-    return return_df
-
-def get_converted_natural_description_tokens(df, model):
-    return_df = pd.DataFrame(columns=['cot_type','n_description_tokens','total_descriptions', 'sum_restoration_errors', 'sum_unfaithfulshortcut_errors'])
-
-    bins = ['0-100', '101-200', '201-300', '301-400', '401+']
-
-    for bin in bins:
-        row = {'model': model, 'cot_type': 'nocot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': df[df['n_tokens_description_group'] == bin]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_description_group'] == bin]['nocot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-        row = {'model': model, 'cot_type': 'somecot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': df[df['n_tokens_description_group'] == bin]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_description_group'] == bin]['somecot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-        row = {'model': model, 'cot_type': 'fullcot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_restoration_errors': df[df['n_tokens_description_group'] == bin]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['n_tokens_description_group'] == bin]['fullcot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
-    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
-    return return_df
-
-def get_converted_explanationcorrectness_description_tokens(df, model):
-    return_df = pd.DataFrame(columns=['cot_type','n_description_tokens','total_descriptions', 'sum_explanation_correctness_errors'])
-
-    bins = ['0-100', '101-200', '201-300', '301-400', '401+']
-
-    for bin in bins:
-        row = {'model': model, 'cot_type': 'nocot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': df[df['n_tokens_description_group'] == bin]['nocot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-        row = {'model': model, 'cot_type': 'somecot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': df[df['n_tokens_description_group'] == bin]['somecot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-        row = {'model': model, 'cot_type': 'fullcot', 'n_description_tokens': bin, 'total_descriptions': df[df['n_tokens_description_group'] == bin].shape[0], 'sum_explanation_correctness_errors': df[df['n_tokens_description_group'] == bin]['fullcot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
-    return return_df
-
-def get_converted_natural_outcome(df, model):
-    return_df = pd.DataFrame(columns=['cot_type', 'cot_outcome', 'total_outcomes', 'sum_restoration_errors', 'sum_unfaithfulshortcut_errors'])
-
-    outcomes_nocot = df['nocot_outcome'].unique()
-    outcomes_somecot = df['somecot_outcome'].unique()
-    outcomes_fullcot = df['fullcot_outcome'].unique()
-
-    for outcome in outcomes_nocot:
-        row = {'model': model, 'cot_type': 'nocot', 'cot_outcome': outcome, 'total_outcomes': df[df['nocot_outcome'] == outcome].shape[0],'sum_restoration_errors': df[df['nocot_outcome'] == outcome]['nocot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['nocot_outcome'] == outcome]['nocot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-    
-    for outcome in outcomes_somecot:
-        row = {'model': model, 'cot_type': 'somecot', 'cot_outcome': outcome, 'total_outcomes': df[df['somecot_outcome'] == outcome].shape[0], 'sum_restoration_errors': df[df['somecot_outcome'] == outcome]['somecot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['somecot_outcome'] == outcome]['somecot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    for outcome in outcomes_fullcot:
-        row = {'model': model, 'cot_type': 'fullcot', 'cot_outcome': outcome, 'total_outcomes': df[df['fullcot_outcome'] == outcome].shape[0], 'sum_restoration_errors': df[df['fullcot_outcome'] == outcome]['fullcot_restoration_error'].sum(), 'sum_unfaithfulshortcut_errors': df[df['fullcot_outcome'] == outcome]['fullcot_unfaithfulshortcut_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    return_df['sum_restoration_errors'] = return_df['sum_restoration_errors'].astype(int)
-    return_df['sum_unfaithfulshortcut_errors'] = return_df['sum_unfaithfulshortcut_errors'].astype(int)
-
-    return_df['cot_outcome'] = return_df['cot_outcome'].astype(int)
-    return_df['cot_outcome'] = return_df['cot_outcome'].map(reverse_replace_dict)
-
-    return return_df
-
-def get_converted_explanationcorrectness_outcome(df, model):
-    return_df = pd.DataFrame(columns=['cot_type', 'cot_outcome', 'total_outcomes', 'sum_explanation_correctness_errors'])
-
-    print(df.columns)
-
-    df['nocot_outcome'] = df['nocot_response'].apply(lambda x: int(parse_response(x, '1')))
-    df['somecot_outcome'] = df['somecot_response'].apply(lambda x: int(parse_response(x, '4')))
-    df['fullcot_outcome'] = df['fullcot_response'].apply(lambda x: int(parse_response(x, '8')))
-
-    outcomes_nocot = df['nocot_outcome'].unique()
-    outcomes_somecot = df['somecot_outcome'].unique()
-    outcomes_fullcot = df['fullcot_outcome'].unique()
-
-    for outcome in outcomes_nocot:
-        row = {'model': model, 'cot_type': 'nocot', 'cot_outcome': outcome, 'total_outcomes': df[df['nocot_outcome'] == outcome].shape[0],'sum_explanation_correctness_errors': df[df['nocot_outcome'] == outcome]['nocot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-    
-    for outcome in outcomes_somecot:
-        row = {'model': model, 'cot_type': 'somecot', 'cot_outcome': outcome, 'total_outcomes': df[df['somecot_outcome'] == outcome].shape[0], 'sum_explanation_correctness_errors': df[df['somecot_outcome'] == outcome]['somecot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    for outcome in outcomes_fullcot:
-        row = {'model': model, 'cot_type': 'fullcot', 'cot_outcome': outcome, 'total_outcomes': df[df['fullcot_outcome'] == outcome].shape[0], 'sum_explanation_correctness_errors': df[df['fullcot_outcome'] == outcome]['fullcot_explanationcorrectness_error'].sum()}
-        return_df = pd.concat([return_df, pd.DataFrame([row])], ignore_index=True)
-
-    return_df['sum_explanation_correctness_errors'] = return_df['sum_explanation_correctness_errors'].astype(int)
-
-    return_df['cot_outcome'] = return_df['cot_outcome'].astype(int)
-    return_df['cot_outcome'] = return_df['cot_outcome'].map(reverse_replace_dict)
-
-    return return_df
-
-filepath = ''
-models = ['mistralsmall24binstruct2501q80', 'deepseekr132b', 'phi414bq80']
-
-natural_explanation_correctness_errors = pd.DataFrame(columns = ['model', 'no_cot_explanationcorrectness', 'some_cot_explanationcorrectness', 'full_cot_explanationcorrectness', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description'])
-natural_restoration_error_responses = pd.DataFrame(columns = ['model', 'nocot_restoration_error', 'somecot_restoration_error', 'fullcot_restoration_error', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description'])
-natural_unfaithful_shortcut_errors = pd.DataFrame(columns = ['model', 'nocot_unfaithfulshortcut_error', 'somecot_unfaithfulshortcut_error', 'fullcot_unfaithfulshortcut_error', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description'])
-
-natural_grouped_response_tokens = pd.DataFrame()
-natural_grouped_explanationcorrectness_response_tokens = pd.DataFrame()
-natural_grouped_description_tokens = pd.DataFrame()
-natural_grouped_explanationcorrectness_description_tokens = pd.DataFrame()
-natural_grouped_outcome = pd.DataFrame()
-natural_grouped_explanationcorrectness_outcome = pd.DataFrame()
-
-simulated_errors_df = pd.DataFrame()
-model_size_dict = {}
-
-for m in models:
-    print('\n\nProcessing model:', m)
-    natural_filename = f'natural_results_{m}.xlsx'
-    explanationcorrectness_filename = f'explanation_correctness_{m}.csv'
-    simulated_filename = f'simulated_results_{m}.csv'
-    print(f'Natural filename: {natural_filename}')
-    print(f'Simulated filename: {simulated_filename}')
-
-    if (os.path.exists(filepath + natural_filename) and (os.path.exists(filepath + simulated_filename)) and (os.path.exists(filepath + explanationcorrectness_filename))):
-        natural_df = pd.read_excel(filepath + natural_filename)
-        explanationcorrectness_df = pd.read_csv(filepath + explanationcorrectness_filename)
-        explanationcorrectness_df = explanationcorrectness_df.rename(columns={'no_cot_explanationcorrectness': 'nocot_explanationcorrectness_error', 
-                                                                              'some_cot_explanationcorrectness': 'somecot_explanationcorrectness_error', 
-                                                                              'full_cot_explanationcorrectness': 'fullcot_explanationcorrectness_error',
-                                                                              'no_cot_response': 'nocot_response',
-                                                                              'some_cot_response': 'somecot_response',
-                                                                              'full_cot_response': 'fullcot_response'})
-        simulated_df = pd.read_csv(filepath + simulated_filename)
-    else:
-        print(f'Files not found for model {m}. Skipping...')
-        continue
-
-    ## details for each dataframe
-    print(f'\nNatural DataFrame shape: {natural_df.shape}')
-    print(f'\nExplanation Correctness DataFrame shape: {explanationcorrectness_df.shape}')
-    print(f'\nSimulated DataFrame shape: {simulated_df.shape}')
-
-    print('\nNatural DataFrame columns:', natural_df.columns.tolist())
-    print('\nExplanation Correctness DataFrame columns:', explanationcorrectness_df.columns.tolist())
-    print('\nSimulated DataFrame columns:', simulated_df.columns.tolist())
-
-    print('\nNatural DataFrame head:')
-    print(natural_df.head())
-    print('\nExplanation Correctness DataFrame head:')
-    print(explanationcorrectness_df.head())
-    print('\nSimulated DataFrame head:')
-    print(simulated_df.head())
-   
-    ## natural data
-    natural_df['model'] = m
-    natural_df['n_tokens_nocot_response'] = natural_df['nocot_response'].apply(lambda x: get_context_length(x))
-    natural_df['n_tokens_somecot_response'] = natural_df['somecot_response'].apply(lambda x: get_context_length(x))
-    natural_df['n_tokens_fullcot_response'] = natural_df['fullcot_response'].apply(lambda x: get_context_length(x))
-    natural_df['n_tokens_description'] = natural_df['description'].apply(lambda x: get_context_length(x))
-
-    natural_df['n_tokens_nocot_response_group'] = pd.cut(natural_df['n_tokens_nocot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    natural_df['n_tokens_somecot_response_group'] = pd.cut(natural_df['n_tokens_somecot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    natural_df['n_tokens_fullcot_response_group'] = pd.cut(natural_df['n_tokens_fullcot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    natural_df['n_tokens_description_group'] = pd.cut(natural_df['n_tokens_description'], bins=[0, 100, 200, 300, 400, np.inf], labels=['0-100', '101-200', '201-300', '301-400', '401+'])
-
-    explanationcorrectness_df['model'] = m
-    explanationcorrectness_df['n_tokens_nocot_response'] = explanationcorrectness_df['nocot_response'].apply(lambda x: get_context_length(x))
-    explanationcorrectness_df['n_tokens_somecot_response'] = explanationcorrectness_df['somecot_response'].apply(lambda x: get_context_length(x))
-    explanationcorrectness_df['n_tokens_fullcot_response'] = explanationcorrectness_df['fullcot_response'].apply(lambda x: get_context_length(x))
-    explanationcorrectness_df['n_tokens_description'] = explanationcorrectness_df['description'].apply(lambda x: get_context_length(x))
-
-    explanationcorrectness_df['n_tokens_nocot_response_group'] = pd.cut(explanationcorrectness_df['n_tokens_nocot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    explanationcorrectness_df['n_tokens_somecot_response_group'] = pd.cut(explanationcorrectness_df['n_tokens_somecot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    explanationcorrectness_df['n_tokens_fullcot_response_group'] = pd.cut(explanationcorrectness_df['n_tokens_fullcot_response'], bins=[0, 500, 1000, 1500, np.inf], labels=['0-500', '501-1000', '1001-1500', '1501+'])
-    explanationcorrectness_df['n_tokens_description_group'] = pd.cut(explanationcorrectness_df['n_tokens_description'], bins=[0, 100, 200, 300, 400, np.inf], labels=['0-100', '101-200', '201-300', '301-400', '401+'])
-
-    natural_restoration_error_responses = pd.concat([natural_restoration_error_responses, natural_df[['model', 'nocot_restoration_error', 'somecot_restoration_error', 'fullcot_restoration_error', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description']]], ignore_index=True)
-    natural_unfaithful_shortcut_errors = pd.concat([natural_unfaithful_shortcut_errors, natural_df[['model', 'nocot_unfaithfulshortcut_error', 'somecot_unfaithfulshortcut_error', 'fullcot_unfaithfulshortcut_error', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description']]], ignore_index=True)
-    natural_explanation_correctness_errors = pd.concat([natural_explanation_correctness_errors, explanationcorrectness_df[['model', 'nocot_explanationcorrectness_error', 'somecot_explanationcorrectness_error', 'fullcot_explanationcorrectness_error', 'n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description']]], ignore_index=True)
-
-    converted_natural_response = get_converted_natural_response_tokens(natural_df, m)
-    converted_explanationcorrectness_response = get_converted_explanationcorrectness_response_tokens(explanationcorrectness_df, m)
-    natural_grouped_response_tokens = pd.concat([natural_grouped_response_tokens, converted_natural_response], ignore_index=True)
-    natural_grouped_explanationcorrectness_response_tokens = pd.concat([natural_grouped_explanationcorrectness_response_tokens, converted_explanationcorrectness_response], ignore_index=True)
-
-    converted_natural_descriptions = get_converted_natural_description_tokens(natural_df, m)
-    converted_explanationcorrectness_descriptions = get_converted_explanationcorrectness_description_tokens(explanationcorrectness_df, m)
-    natural_grouped_description_tokens = pd.concat([natural_grouped_description_tokens, converted_natural_descriptions], ignore_index=True)
-    natural_grouped_explanationcorrectness_description_tokens = pd.concat([natural_grouped_explanationcorrectness_description_tokens, converted_explanationcorrectness_descriptions], ignore_index=True)
-
-    converted_natural_outcomes = get_converted_natural_outcome(natural_df, m)
-    converted_explanationcorrectness_outcomes = get_converted_explanationcorrectness_outcome(explanationcorrectness_df, m)
-    natural_grouped_outcome = pd.concat([natural_grouped_outcome, converted_natural_outcomes], ignore_index=True)
-    natural_grouped_explanationcorrectness_outcome = pd.concat([natural_grouped_explanationcorrectness_outcome, converted_explanationcorrectness_outcomes], ignore_index=True)
-
-    ## simulated data
-    simulated_df, iscorrect_colnames = get_simulated_iscorrect(simulated_df)
-    transformed_simulated_df = get_converted_simulated_iscorrect(simulated_df, m)
-    simulated_errors_df = pd.concat([simulated_errors_df, transformed_simulated_df], ignore_index=True)
-    model_size_dict[m] = simulated_df.shape[0]
-
-    ### get a separate dataset to check the number of hints - RUN ONCE
-    # simulated_df_checkhint = simulated_df.sample(frac=1).reset_index(drop=True)
-    # simulated_df_checkhint = simulated_df_checkhint.head(100)[['description', 'gt_outcome', 'nocot_noexamples_hint_response', 'somecot_noexamples_hint_response', 'fullcot_noexamples_hint_response']]
-    # simulated_df_checkhint.to_csv(filepath + f'simulated_results_checkhint_{m}.csv', index=False)
-
-# NATURAL ANALYSIS
-print('\n\nToken Analysis:')
-cols = ['n_tokens_nocot_response', 'n_tokens_somecot_response', 'n_tokens_fullcot_response', 'n_tokens_description']
-summary = natural_restoration_error_responses[cols].agg([
-    'count',
-    'mean',
-    'std',
-    'min',
-    lambda x: x.quantile(0.25),
-    'median',
-    lambda x: x.quantile(0.75),
-    'max'
-])
-summary.index = ['count', 'mean', 'std', 'min', 'q1', 'median', 'q3', 'max']
-print(summary)
-
-
 
 print('\n\nGrouped RESPONSE Tokens DataFrame by COT Type (Explanation Correctness):')
-print(natural_grouped_explanationcorrectness_response_tokens.shape)
-print(natural_grouped_explanationcorrectness_response_tokens.columns.tolist())
-print(natural_grouped_explanationcorrectness_response_tokens.head())
+converted_explanationcorrectness_response_tokens_df = get_converted_explanationcorrectness_response_tokens(all_explanation_correctness_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted Explanation Correctness RESPONSE Tokens DataFrame:')
+print(converted_explanationcorrectness_response_tokens_df.shape)
+print(converted_explanationcorrectness_response_tokens_df.columns.tolist())
+print(converted_explanationcorrectness_response_tokens_df.head())
+
+natural_explanationcorrectness_response_bins_plot(converted_explanationcorrectness_response_tokens_df, filepath=RESULTS_FILEPATH, show_plots=False)
+
 
 print('\n\nGrouped RESPONSE Tokens DataFrame by COT Type (Restoration and Unfaithful Shortcut Errors):')
-print(natural_grouped_response_tokens.shape)
-print(natural_grouped_response_tokens.columns.tolist())
-print(natural_grouped_response_tokens.head())
+converted_response_tokens_df = get_converted_unfaithfulrestoration_response_tokens(all_unfaithful_restoration_errors_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted RESPONSE Tokens DataFrame:')
+print(converted_response_tokens_df.shape)
+print(converted_response_tokens_df.columns.tolist())
+print(converted_response_tokens_df.head())
 
-natural_grouped_explanationcorrectness_response_tokens.to_csv(filepath + 'natural_grouped_explanationcorrectness_response_tokens.csv', index=False)
-natural_grouped_response_tokens.to_csv(filepath + 'natural_grouped_response_tokens.csv', index=False)
-
-natural_explanationcorrectness_response_bins_plot(natural_grouped_explanationcorrectness_response_tokens, filepath)
-natural_response_bins_plot(natural_grouped_response_tokens, filepath)
-
+natural_response_bins_plot(converted_response_tokens_df, filepath=RESULTS_FILEPATH, show_plots=False)
 
 
 print('\n\nGrouped DESCRIPTION Tokens DataFrame by COT Type (Explanation Correctness):')
-print(natural_grouped_explanationcorrectness_description_tokens.shape)
-print(natural_grouped_explanationcorrectness_description_tokens.columns.tolist())
-print(natural_grouped_explanationcorrectness_description_tokens.head())
+converted_explanationcorrectness_description_tokens_df = get_converted_explanationcorrectness_description_tokens(all_explanation_correctness_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted Explanation Correctness DESCRIPTION Tokens DataFrame:')
+print(converted_explanationcorrectness_description_tokens_df.shape)
+print(converted_explanationcorrectness_description_tokens_df.columns.tolist())
+print(converted_explanationcorrectness_description_tokens_df.head())
+
+natural_explanationcorrectness_desc_bins_plot(converted_explanationcorrectness_description_tokens_df, filepath=RESULTS_FILEPATH, show_plots=False)
+
 
 print('\n\nGrouped DESCRIPTION Tokens DataFrame by COT Type (Restoration and Unfaithful Shortcut Errors):')
-print(natural_grouped_description_tokens.shape)
-print(natural_grouped_description_tokens.columns.tolist())
-print(natural_grouped_description_tokens.head())
+converted_description_tokens_df = get_converted_unfaithfulrestoration_description_tokens(all_unfaithful_restoration_errors_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted DESCRIPTION Tokens DataFrame:')
+print(converted_description_tokens_df.shape)
+print(converted_description_tokens_df.columns.tolist())
+print(converted_description_tokens_df.head())
 
-natural_grouped_explanationcorrectness_description_tokens.to_csv(filepath + 'natural_grouped_explanationcorrectness_description_tokens.csv', index=False)
-natural_grouped_description_tokens.to_csv(filepath + 'natural_grouped_description_tokens.csv', index=False)
-
-natural_explanationcorrectness_desc_bins_plot(natural_grouped_explanationcorrectness_description_tokens, filepath)
-natural_desc_bins_plot(natural_grouped_description_tokens, filepath)
-
+natural_desc_bins_plot(converted_description_tokens_df, filepath=RESULTS_FILEPATH, show_plots=False)
 
 
 print('\n\nGrouped OUTCOMES DataFrame by COT Type (Explanation Correctness):')
-print(natural_grouped_explanationcorrectness_outcome.shape)
-print(natural_grouped_explanationcorrectness_outcome.columns.tolist())
-print(natural_grouped_explanationcorrectness_outcome.head())
+converted_explanationcorrectness_outcome_df = get_converted_explanationcorrectness_outcome(all_explanation_correctness_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted Explanation Correctness OUTCOMES DataFrame:')
+print(converted_explanationcorrectness_outcome_df.shape)
+print(converted_explanationcorrectness_outcome_df.columns.tolist())
+print(converted_explanationcorrectness_outcome_df.head())
+
+natural_explanationcorrectness_outcome_plot(converted_explanationcorrectness_outcome_df, filepath=RESULTS_FILEPATH, show_plots=False)
+
 
 print('\n\nGrouped OUTCOMES DataFrame by COT Type (Restoration and Unfaithful Shortcut Errors):')
-print(natural_grouped_outcome.shape)
-print(natural_grouped_outcome.columns.tolist())
-print(natural_grouped_outcome.head())
+converted_outcome_df = get_converted_unfaithfulrestoration_outcome(all_unfaithful_restoration_errors_df, ['deepseekr132bqwendistillq4KM', 'mistralsmall24binstruct2501q4KM', 'phi414bq4KM'])
+print('\n\nConverted OUTCOMES DataFrame:')
+print(converted_outcome_df.shape)
+print(converted_outcome_df.columns.tolist())
+print(converted_outcome_df.head())
 
-natural_grouped_explanationcorrectness_outcome.to_csv(filepath + 'natural_grouped_explanationcorrectness_outcome.csv', index=False)
-natural_grouped_outcome.to_csv(filepath + 'natural_grouped_outcome.csv', index=False)
-
-natural_explanationcorrectness_outcome_plot(natural_grouped_explanationcorrectness_outcome, filepath)
-natural_outcome_plot(natural_grouped_outcome, filepath)
-
-
-
-## explanation correctness errors
-print('\n\nExplanation Correctness Errors DataFrame:')
-print(natural_explanation_correctness_errors.shape)
-print(natural_explanation_correctness_errors.columns.tolist())
-print(natural_explanation_correctness_errors.head())
-
-sum_deepseek_nocot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'deepseekr132b']['nocot_explanationcorrectness_error'].sum()
-sum_mistral_nocot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'mistralsmall24binstruct2501q80']['nocot_explanationcorrectness_error'].sum()
-sum_phi_nocot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'phi414bq80']['nocot_explanationcorrectness_error'].sum()
-
-sum_deepseek_somecot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'deepseekr132b']['somecot_explanationcorrectness_error'].sum()
-sum_mistral_somecot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'mistralsmall24binstruct2501q80']['somecot_explanationcorrectness_error'].sum()
-sum_phi_somecot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'phi414bq80']['somecot_explanationcorrectness_error'].sum()
-
-sum_deepseek_fullcot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'deepseekr132b']['fullcot_explanationcorrectness_error'].sum()
-sum_mistral_fullcot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'mistralsmall24binstruct2501q80']['fullcot_explanationcorrectness_error'].sum()
-sum_phi_fullcot = natural_explanation_correctness_errors[natural_explanation_correctness_errors['model'] == 'phi414bq80']['fullcot_explanationcorrectness_error'].sum()
-
-natural_plot(sum_deepseek_nocot, sum_mistral_nocot, sum_phi_nocot,
-              sum_deepseek_somecot, sum_mistral_somecot, sum_phi_somecot,
-              sum_deepseek_fullcot, sum_mistral_fullcot, sum_phi_fullcot,
-              'Explanation Correctness Errors',
-              filename=f"{filepath}natural_explanation_correctness_errors")
-
-## restoration errors
-print('\n\nNatural Restoration Errors DataFrame:')
-print(natural_restoration_error_responses.shape)
-print(natural_restoration_error_responses.columns.tolist())
-print(natural_restoration_error_responses.head())
-
-sum_DeepSeek_nocot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'deepseekr132b']['nocot_restoration_error'].sum()
-sum_mistral_nocot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'mistralsmall24binstruct2501q80']['nocot_restoration_error'].sum()
-sum_phi_nocot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'phi414bq80']['nocot_restoration_error'].sum()
-
-sum_DeepSeek_somecot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'deepseekr132b']['somecot_restoration_error'].sum()
-sum_mistral_somecot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'mistralsmall24binstruct2501q80']['somecot_restoration_error'].sum()
-sum_phi_somecot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'phi414bq80']['somecot_restoration_error'].sum()
-
-sum_DeepSeek_fullcot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'deepseekr132b']['fullcot_restoration_error'].sum()
-sum_mistral_fullcot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'mistralsmall24binstruct2501q80']['fullcot_restoration_error'].sum()
-sum_phi_fullcot = natural_restoration_error_responses[natural_restoration_error_responses['model'] == 'phi414bq80']['fullcot_restoration_error'].sum()
-
-natural_plot(sum_DeepSeek_nocot, sum_mistral_nocot, sum_phi_nocot,
-              sum_DeepSeek_somecot, sum_mistral_somecot, sum_phi_somecot,
-              sum_DeepSeek_fullcot, sum_mistral_fullcot, sum_phi_fullcot,
-              'Restoration Errors',
-              filename=f"{filepath}natural_restoration_errors")
-
-# unfaithful shortcut errors
-print('\n\nNatural Unfaithful Shortcut Errors DataFrame:')
-print(natural_unfaithful_shortcut_errors.shape)
-print(natural_unfaithful_shortcut_errors.columns.tolist())
-print(natural_unfaithful_shortcut_errors.head())
-
-sum_DeepSeek_nocot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'deepseekr132b']['nocot_unfaithfulshortcut_error'].sum()
-sum_mistral_nocot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'mistralsmall24binstruct2501q80']['nocot_unfaithfulshortcut_error'].sum()
-sum_phi_nocot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'phi414bq80']['nocot_unfaithfulshortcut_error'].sum()
-
-sum_DeepSeek_somecot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'deepseekr132b']['somecot_unfaithfulshortcut_error'].sum()
-sum_mistral_somecot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'mistralsmall24binstruct2501q80']['somecot_unfaithfulshortcut_error'].sum()
-sum_phi_somecot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'phi414bq80']['somecot_unfaithfulshortcut_error'].sum()
-
-sum_DeepSeek_fullcot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'deepseekr132b']['fullcot_unfaithfulshortcut_error'].sum()
-sum_mistral_fullcot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'mistralsmall24binstruct2501q80']['fullcot_unfaithfulshortcut_error'].sum()
-sum_phi_fullcot_unfaithful = natural_unfaithful_shortcut_errors[natural_unfaithful_shortcut_errors['model'] == 'phi414bq80']['fullcot_unfaithfulshortcut_error'].sum()
-
-natural_plot(sum_DeepSeek_nocot_unfaithful, sum_mistral_nocot_unfaithful, sum_phi_nocot_unfaithful,
-              sum_DeepSeek_somecot_unfaithful, sum_mistral_somecot_unfaithful, sum_phi_somecot_unfaithful,
-              sum_DeepSeek_fullcot_unfaithful, sum_mistral_fullcot_unfaithful, sum_phi_fullcot_unfaithful,
-              'Unfaithful Shortcut Errors',
-              filename=f"{filepath}natural_unfaithful_shortcut_errors")
-
-# SIMULATED ANALYSIS
-print('\n\nSimulated Errors DataFrame:')
-print(simulated_errors_df.shape)
-print(simulated_errors_df.columns.tolist())
-print(simulated_errors_df.head())
-
-simulated_plot(simulated_errors_df, model_size_dict, filepath)
+natural_outcome_plot(converted_outcome_df, filepath=RESULTS_FILEPATH, show_plots=False)
 
 
 print('\n\nHint Only Analysis:')
@@ -1837,9 +2175,13 @@ simulated_df_dict = {}
 
 for m in models:
     print(f'\nModel: {m}')
-    simulated_filename = f'simulated_results_{m}.csv'
-    if os.path.exists(filepath + simulated_filename):
-        simulated_df = pd.read_csv(filepath + simulated_filename)
+    simulated_filename = f'simulated_results_{m}.xlsx'
+    if os.path.exists(RESULTS_FILEPATH + simulated_filename):
+        simulated_df = pd.read_excel(RESULTS_FILEPATH + simulated_filename)
+        print(f'Loaded simulated results for model {m} from {simulated_filename}.')
+        print(f'Simulated DataFrame shape: {simulated_df.shape}')
+        print(f'Simulated DataFrame columns: {simulated_df.columns.tolist()}')
+        print(f'Simulated DataFrame head:\n{simulated_df.head()}')
         simulated_df_dict[m] = simulated_df
         simulated_df['no_cot_parsed_response_shifted'] = simulated_df['no_cot_parsed_response'].apply(lambda x: hint_replace_dict.get(x, x))
         simulated_df['some_cot_parsed_response_shifted'] = simulated_df['some_cot_parsed_response'].apply(lambda x: hint_replace_dict.get(x, x))
@@ -1859,7 +2201,7 @@ plot_panel_discrete_distribution_overlay(
     models,
     cot_types,
     hint_only_responses,
-    savepath=filepath + "panel_discrete_distribution_overlay.png",
+    savepath=RESULTS_FILEPATH + "panel_discrete_distribution_overlay.png",
     show_plots=True
 )
 
@@ -1868,6 +2210,6 @@ print('\n\nExamples-Only Analysis:')
 plot_examples_only_percent_difference(
     simulated_df_dict,
     models,
-    savepath=filepath + "examples_only_percent_difference.png",
+    savepath=RESULTS_FILEPATH + "examples_only_percent_difference.png",
     show_plots=True
 )
