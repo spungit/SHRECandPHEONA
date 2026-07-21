@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 import seaborn as sns
 import tiktoken
-from scipy.stats import chi2_contingency
+from scipy.stats import chi2_contingency, ttest_rel
 from sklearn.metrics import cohen_kappa_score, balanced_accuracy_score
 
 from utils import *
@@ -926,9 +926,80 @@ print('Shape:', all_iscorrect_df.shape)
 print(f'Columns in all_iscorrect_df: {all_iscorrect_df.columns.tolist()}')
 print(all_iscorrect_df.head())
 
-average_iscorrect_df = all_iscorrect_df.groupby('model')[iscorrect_colnames].mean().reset_index()
+# Group by model and trial to get per-trial statistics
+trial_stats = all_iscorrect_df.groupby(['model', 'trial'])[iscorrect_colnames].mean().reset_index()
+
+
+# Average across trials to get overall mean (preserves plot output)
+average_iscorrect_df = trial_stats.groupby('model')[iscorrect_colnames].mean().reset_index()
 balanced_iscorrect_df = all_iscorrect_df.groupby('model').apply(lambda x: pd.Series({col: balanced_accuracy_score(x[outcome_colnames[0]], x[col]) for col in iscorrect_colnames})).reset_index()
-stddev_iscorrect_df = all_iscorrect_df.groupby('model')[iscorrect_colnames].std().reset_index()
+# Calculate std of trial means (captures trial-to-trial variation with sample std dev)
+stddev_iscorrect_df = trial_stats.groupby('model')[iscorrect_colnames].std(ddof=1).reset_index()
+
+# Paired t-tests of model trial means against unbiased parsed-response trial means
+alpha = 0.001
+baseline_map = {}
+for col in iscorrect_colnames:
+    parts = col.replace('iscorrect_', '').split('_')
+    cot_type = parts[0] if len(parts) >= 1 else None
+    if col == f'iscorrect_{cot_type}_parsed_response':
+        baseline_map[col] = None
+    else:
+        baseline_map[col] = f'iscorrect_{cot_type}_parsed_response' if cot_type else None
+
+
+def fdr_bh(pvals):
+    pvals = np.asarray(pvals, dtype=float)
+    adjusted = np.full_like(pvals, np.nan)
+    valid_mask = ~np.isnan(pvals)
+    if valid_mask.sum() == 0:
+        return adjusted
+    valid_pvals = pvals[valid_mask]
+    order = np.argsort(valid_pvals)
+    sorted_pvals = valid_pvals[order]
+    n = len(sorted_pvals)
+    adjusted_sorted = np.empty(n, dtype=float)
+    min_adj = 1.0
+    for i in range(n - 1, -1, -1):
+        adj = sorted_pvals[i] * n / (i + 1)
+        min_adj = min(min_adj, adj)
+        adjusted_sorted[i] = min_adj
+    adjusted_sorted = np.minimum(adjusted_sorted, 1.0)
+    adjusted[valid_mask] = adjusted_sorted[np.argsort(order)]
+    return adjusted
+
+
+def adjust_fdr_pvalues_df(df):
+    pvals = df.drop(columns='model').to_numpy(dtype=float)
+    flat = pvals.flatten()
+    adjusted_flat = fdr_bh(flat)
+    adjusted = adjusted_flat.reshape(pvals.shape)
+    adjusted_df = pd.DataFrame(adjusted, columns=df.columns.drop('model'))
+    adjusted_df.insert(0, 'model', df['model'].values)
+    return adjusted_df
+
+# Build t-test p-values relative to unbiased parsed-response baseline values
+
+t_test_rows = []
+for model in trial_stats['model'].unique():
+    model_trials = trial_stats[trial_stats['model'] == model].copy()
+    t_test_row = {'model': model}
+    for col in iscorrect_colnames:
+        baseline_col = baseline_map.get(col)
+        if baseline_col is None or baseline_col not in model_trials.columns:
+            t_test_row[col] = np.nan
+            continue
+
+        paired = model_trials[['trial', col, baseline_col]].dropna()
+        if paired.shape[0] >= 2:
+            _, p_val = ttest_rel(paired[col].astype(float), paired[baseline_col].astype(float), nan_policy='omit')
+        else:
+            p_val = np.nan
+        t_test_row[col] = p_val
+    t_test_rows.append(t_test_row)
+
+test_pvalues_df = pd.DataFrame(t_test_rows)
+fdr_pvalues_df = adjust_fdr_pvalues_df(test_pvalues_df)
 
 print('\n\nAverage iscorrect values by model and description:')
 print(average_iscorrect_df.head())
@@ -936,9 +1007,60 @@ print('\n\nAverage balanced accuracy of iscorrect values by model and descriptio
 print(balanced_iscorrect_df.head())
 print('\n\nStandard deviation of iscorrect values by model and description:')
 print(stddev_iscorrect_df.head())
+print('\n\nT-test p-values for model trial means against unbiased parsed-response baselines:')
+print(test_pvalues_df.head())
+print('\n\nFDR-adjusted p-values for the paired t-tests across all conditions:')
+print(fdr_pvalues_df.head())
 
 average_iscorrect_df.to_excel(RESULTS_FILEPATH + 'average_iscorrect_values.xlsx', index=False)
 stddev_iscorrect_df.to_excel(RESULTS_FILEPATH + 'stddev_iscorrect_values.xlsx', index=False)
+
+# Create structured long-form Excel file with model, cot_type, experiment, avg, std
+structured_data = []
+
+for model in average_iscorrect_df['model'].unique():
+    avg_row = average_iscorrect_df[average_iscorrect_df['model'] == model].iloc[0]
+    std_row = stddev_iscorrect_df[stddev_iscorrect_df['model'] == model].iloc[0]
+    
+    for col_name in iscorrect_colnames:
+        # Parse column name: iscorrect_<cot>_<experiment>
+        # Examples: iscorrect_nocot_randomfewshot_hint, iscorrect_nocot_parsed_response, iscorrect_nocot_noexamples_hint_parsed_response
+        parts = col_name.replace('iscorrect_', '').split('_')
+        
+        cot_type = parts[0]  # nocot, somecot, or fullcot
+        
+        # Determine experiment type based on remaining parts
+        remaining = '_'.join(parts[1:])
+        if remaining == 'parsed_response':
+            experiment = 'unbiased'
+        elif remaining == 'noexamples_hint_parsed_response':
+            experiment = 'noexamples_hint'
+        else:
+            experiment = remaining
+        
+        avg_val = round(float(avg_row[col_name]), 3)
+        std_val = round(float(std_row[col_name]), 3)
+        p_val = None
+        adjusted_p_val = None
+        if not test_pvalues_df.empty:
+            p_val_values = test_pvalues_df.loc[test_pvalues_df['model'] == model, col_name].values
+            p_val = float(p_val_values[0]) if len(p_val_values) > 0 and not pd.isna(p_val_values[0]) else None
+        if not fdr_pvalues_df.empty:
+            adj_p_val_values = fdr_pvalues_df.loc[fdr_pvalues_df['model'] == model, col_name].values
+            adjusted_p_val = float(adj_p_val_values[0]) if len(adj_p_val_values) > 0 and not pd.isna(adj_p_val_values[0]) else None
+        structured_data.append({
+            'model': model,
+            'cot_type': cot_type,
+            'experiment': experiment,
+            'avg': avg_val,
+            'std': std_val,
+            'p_value': round(p_val, 6) if p_val is not None else None,
+            'fdr_p_value': round(adjusted_p_val, 6) if adjusted_p_val is not None else None
+        })
+structured_df = pd.DataFrame(structured_data)
+structured_df.to_excel(RESULTS_FILEPATH + 'simulated_results_structured.xlsx', index=False)
+print('\n\nStructured results saved to:', RESULTS_FILEPATH + 'simulated_results_structured.xlsx')
+print(structured_df.head(20))
 
 simulated_plot(average_iscorrect_df, RESULTS_FILEPATH + 'simulated_analysis_panel', show_plots=True)
 
